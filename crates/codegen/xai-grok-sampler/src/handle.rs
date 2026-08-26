@@ -82,6 +82,14 @@ impl SamplerHandle {
         });
     }
 
+    /// Replace the failover chain walked when a request's provider fails
+    /// fatally before any output. Fire-and-forget like `update_config`.
+    pub fn update_chain(&self, chain: crate::FailoverChain) {
+        let _ = self.cmd_tx.send(SamplerCommand::UpdateChain {
+            chain: Box::new(chain),
+        });
+    }
+
     /// Query whether a request is still in flight. Returns `false`
     /// for unknown / finished / cancelled ids.
     pub async fn is_active(&self, request_id: RequestId) -> bool {

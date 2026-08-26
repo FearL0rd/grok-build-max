@@ -401,6 +401,13 @@ pub fn format_sampling_error(err: &SamplingError, retry_count: Option<u32>) -> S
                 triggers.join(", ")
             )
         }
+        SamplingError::ProviderFailed { providers } => {
+            format!(
+                "{}All providers failed: {}. Check your provider chain configuration.",
+                retry_prefix,
+                providers.join(" -> ")
+            )
+        }
     }
 }
 
@@ -474,6 +481,9 @@ pub(crate) fn clone_error(err: &SamplingError) -> SamplingError {
         } => SamplingError::DoomLoopDetected {
             triggers: triggers.clone(),
             aborted_at_chunk: *aborted_at_chunk,
+        },
+        SamplingError::ProviderFailed { providers } => SamplingError::ProviderFailed {
+            providers: providers.clone(),
         },
     }
 }

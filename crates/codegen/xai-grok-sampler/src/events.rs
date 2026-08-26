@@ -170,6 +170,30 @@ pub enum SamplingEvent {
         /// For web search: `{"query": "...", "sources": [{"url": "..."}, ...]}`
         result: Option<serde_json::Value>,
     },
+
+    /// A failover chain entry was skipped before any request was attempted
+    /// (e.g. missing `api_key` on a keyed provider).
+    ProviderSkipped {
+        request_id: RequestId,
+        name: std::sync::Arc<str>,
+        reason: std::sync::Arc<str>,
+    },
+
+    /// A chain entry failed fatally before any output and the walk moved to
+    /// the next provider.
+    ProviderRolledOver {
+        request_id: RequestId,
+        from: std::sync::Arc<str>,
+        to: std::sync::Arc<str>,
+        reason: String,
+    },
+
+    /// Every entry in the failover chain failed; nothing was attempted
+    /// successfully. Terminal for the request.
+    ProviderFailed {
+        request_id: RequestId,
+        providers: Vec<String>,
+    },
 }
 
 /// Serializable mirror of [`SamplingError`].
@@ -235,6 +259,7 @@ pub enum SamplingErrorKind {
     EmptyResponse,
     MaxTokensTruncation,
     DoomLoopDetected,
+    ProviderFailed,
 }
 
 impl SamplingErrorKind {
@@ -254,6 +279,7 @@ impl SamplingErrorKind {
             SamplingErrorKind::EmptyResponse => "empty_response",
             SamplingErrorKind::MaxTokensTruncation => "max_tokens_truncation",
             SamplingErrorKind::DoomLoopDetected => "doom_loop_detected",
+            SamplingErrorKind::ProviderFailed => "provider_failed",
         }
     }
 }
@@ -297,6 +323,9 @@ impl From<&SamplingError> for SamplingErrorInfo {
             }
             SamplingError::DoomLoopDetected { .. } => {
                 (SamplingErrorKind::DoomLoopDetected, None, None, None)
+            }
+            SamplingError::ProviderFailed { .. } => {
+                (SamplingErrorKind::ProviderFailed, None, None, None)
             }
         };
 

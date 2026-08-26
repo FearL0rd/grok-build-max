@@ -26,6 +26,9 @@ pub(crate) struct ActorState {
     pub(crate) active_requests: HashMap<RequestId, ActiveRequest>,
     pub(crate) config: SamplerConfig,
     pub(crate) retry_policy: RetryPolicy,
+    /// Ordered failover chain. Empty = single-provider behavior using
+    /// `config`.
+    pub(crate) failover_chain: Vec<(String, SamplerConfig)>,
 }
 
 impl ActorState {
@@ -34,6 +37,7 @@ impl ActorState {
             active_requests: HashMap::new(),
             config,
             retry_policy,
+            failover_chain: Vec::new(),
         }
     }
 
@@ -70,6 +74,11 @@ impl ActorState {
     pub(crate) fn update_config(&mut self, config: SamplerConfig) {
         self.config = config;
     }
+
+    /// Replace the failover chain.
+    pub(crate) fn update_chain(&mut self, chain: Vec<(String, SamplerConfig)>) {
+        self.failover_chain = chain;
+    }
 }
 
 #[cfg(test)]
@@ -82,6 +91,7 @@ mod tests {
     fn cfg() -> SamplerConfig {
         SamplerConfig {
             api_key: None,
+            keyless: false,
             base_url: "https://example.test".into(),
             model: "test-model".into(),
             max_completion_tokens: None,

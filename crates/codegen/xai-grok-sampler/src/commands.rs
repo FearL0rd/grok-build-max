@@ -36,6 +36,10 @@ pub(crate) enum SamplerCommand {
     /// Update the default sampling config (model switch, auth refresh).
     UpdateConfig { config: Box<SamplerConfig> },
 
+    /// Replace the failover chain used for requests submitted without a
+    /// per-request config override.
+    UpdateChain { chain: Box<crate::FailoverChain> },
+
     /// Query: is a specific request still in flight?
     IsActive {
         request_id: RequestId,

@@ -72,6 +72,7 @@ impl MockServer {
 fn test_config(base_url: String, model: &str) -> SamplerConfig {
     SamplerConfig {
         api_key: Some("test-key".into()),
+        keyless: false,
         base_url,
         model: model.into(),
         max_completion_tokens: Some(1024),
@@ -1406,4 +1407,249 @@ async fn await_event_matching(
             Err(_) => return None,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Failover chain walk
+// ---------------------------------------------------------------------------
+
+/// Terminal event for chain tests: Completed, Failed, or ProviderFailed.
+async fn recv_until_chain_terminal(
+    rx: &mut mpsc::UnboundedReceiver<SamplingEvent>,
+) -> SamplingEvent {
+    loop {
+        let ev = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("timed out waiting for terminal event")
+            .expect("event channel closed");
+        match ev {
+            SamplingEvent::Completed { .. }
+            | SamplingEvent::Failed { .. }
+            | SamplingEvent::ProviderFailed { .. } => return ev,
+            _ => continue,
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chain_first_provider_success_never_rolls_over() {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            let events = sse::chat_completion_events("hi", "test-model");
+            Sse::new(stream::iter(
+                events.into_iter().map(Ok::<_, std::convert::Infallible>),
+            ))
+        }),
+    );
+    let server = MockServer::spawn(app).await;
+    let dead = "http://127.0.0.1:9/v1"; // closed port => connect error => Fatal
+    let chain = vec![
+        ("primary".to_string(), test_config(server.base_url(), "m")),
+        ("backup".to_string(), test_config(dead.to_string(), "b")),
+    ];
+
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let handle = SamplerActor::spawn(
+        test_config(dead.to_string(), "seed"),
+        RetryPolicy::default(),
+        event_tx,
+    );
+    handle.update_chain(chain);
+    handle.submit(RequestId::from("chain-1"), user_request("say hi"));
+
+    match recv_until_chain_terminal(&mut event_rx).await {
+        SamplingEvent::Completed { .. } => {}
+        SamplingEvent::ProviderRolledOver { .. } | SamplingEvent::ProviderFailed { .. } => {
+            panic!("first provider succeeded; no rollover noise expected")
+        }
+        other => panic!("expected Completed, got {other:?}"),
+    }
+    server.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chain_rolls_over_on_fatal_before_output() {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            let events = sse::chat_completion_events("saved", "test-model");
+            Sse::new(stream::iter(
+                events.into_iter().map(Ok::<_, std::convert::Infallible>),
+            ))
+        }),
+    );
+    let server = MockServer::spawn(app).await;
+    let dead = "http://127.0.0.1:9/v1";
+    let chain = vec![
+        ("dead".to_string(), test_config(dead.to_string(), "d")),
+        ("alive".to_string(), test_config(server.base_url(), "a")),
+    ];
+
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let handle = SamplerActor::spawn(
+        test_config(dead.to_string(), "seed"),
+        RetryPolicy::default(),
+        event_tx,
+    );
+    handle.update_chain(chain);
+    handle.submit(RequestId::from("chain-2"), user_request("hello"));
+
+    let mut saw_rollover = false;
+    let terminal = loop {
+        let ev = tokio::time::timeout(Duration::from_secs(10), event_rx.recv())
+            .await
+            .expect("timed out")
+            .expect("channel closed");
+        match ev {
+            SamplingEvent::ProviderRolledOver { from, to, .. } => {
+                assert_eq!((from.as_ref(), to.as_ref()), ("dead", "alive"));
+                saw_rollover = true;
+            }
+            SamplingEvent::Completed { .. }
+            | SamplingEvent::Failed { .. }
+            | SamplingEvent::ProviderFailed { .. } => break ev,
+            _ => {}
+        }
+    };
+    assert!(
+        matches!(terminal, SamplingEvent::Completed { .. }),
+        "{terminal:?}"
+    );
+    assert!(saw_rollover);
+    server.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chain_does_not_roll_over_after_partial_output() {
+    // First provider streams one valid chunk (output observed), then a
+    // malformed SSE data event => Serialization error mid-stream, AFTER
+    // output was observed. The request must FAIL against that provider —
+    // no rollover.
+    let sse = concat!(
+        "data: {\"id\":\"chatcmpl-test\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"par\"},\"finish_reason\":null}]}\n\n",
+        "data: {not-json\n\n",
+    );
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move || async move {
+            axum::response::Response::builder()
+                .header("content-type", "text/event-stream")
+                .body(axum::body::Body::from(sse))
+                .unwrap()
+        }),
+    );
+    let killer = MockServer::spawn(app).await;
+    let dead = "http://127.0.0.1:9/v1";
+    let chain = vec![
+        ("partial".to_string(), test_config(killer.base_url(), "p")),
+        ("next".to_string(), test_config(dead.to_string(), "n")),
+    ];
+
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let handle = SamplerActor::spawn(
+        test_config(killer.base_url(), "seed"),
+        RetryPolicy::default(),
+        event_tx,
+    );
+    handle.update_chain(chain);
+    handle.submit(RequestId::from("chain-3"), user_request("go"));
+
+    match recv_until_chain_terminal(&mut event_rx).await {
+        SamplingEvent::Failed { error, .. } => {
+            assert!(
+                !error.message.starts_with("all providers failed"),
+                "must be the underlying transport failure, not chain exhaustion: {}",
+                error.message
+            );
+        }
+        SamplingEvent::ProviderFailed { providers, .. } => {
+            panic!("must NOT roll over after partial output; got exhausted {providers:?}")
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    killer.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chain_exhaustion_emits_provider_failed_error() {
+    let dead = "http://127.0.0.1:9/v1";
+    let chain = vec![
+        ("a".to_string(), test_config(dead.to_string(), "ma")),
+        ("b".to_string(), test_config(dead.to_string(), "mb")),
+    ];
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let handle = SamplerActor::spawn(
+        test_config(dead.to_string(), "seed"),
+        RetryPolicy::default(),
+        event_tx,
+    );
+    handle.update_chain(chain);
+    handle.submit(RequestId::from("chain-4"), user_request("hi"));
+
+    match recv_until_chain_terminal(&mut event_rx).await {
+        SamplingEvent::ProviderFailed { providers, .. } => {
+            assert_eq!(providers, vec!["a".to_string(), "b".to_string()])
+        }
+        other => panic!("expected ProviderFailed, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chain_entry_without_api_key_is_skipped() {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            let events = sse::chat_completion_events("ok", "test-model");
+            Sse::new(stream::iter(
+                events.into_iter().map(Ok::<_, std::convert::Infallible>),
+            ))
+        }),
+    );
+    let server = MockServer::spawn(app).await;
+
+    let mut keyless = test_config(server.base_url(), "k");
+    keyless.api_key = None;
+    let keyed = test_config(server.base_url(), "g");
+    let chain = vec![
+        ("keyless".to_string(), keyless),
+        ("keyed".to_string(), keyed),
+    ];
+
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let handle = SamplerActor::spawn(
+        test_config("http://127.0.0.1:9/v1".to_string(), "seed"),
+        RetryPolicy::default(),
+        event_tx,
+    );
+    handle.update_chain(chain);
+    handle.submit(RequestId::from("chain-5"), user_request("hi"));
+
+    let mut saw_skip = false;
+    let terminal = loop {
+        let ev = tokio::time::timeout(Duration::from_secs(10), event_rx.recv())
+            .await
+            .expect("timed out")
+            .expect("channel closed");
+        match ev {
+            SamplingEvent::ProviderSkipped { name, reason, .. } => {
+                assert_eq!(name.as_ref(), "keyless");
+                assert!(reason.as_ref().contains("api_key"));
+                saw_skip = true;
+            }
+            SamplingEvent::Completed { .. }
+            | SamplingEvent::Failed { .. }
+            | SamplingEvent::ProviderFailed { .. } => break ev,
+            _ => {}
+        }
+    };
+    assert!(
+        matches!(terminal, SamplingEvent::Completed { .. }),
+        "{terminal:?}"
+    );
+    assert!(
+        saw_skip,
+        "ProviderSkipped must be emitted for keyless entry"
+    );
+    server.shutdown();
 }

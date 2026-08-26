@@ -57,3 +57,8 @@ pub use retry::{
 pub use sampling_log::AuthInfo;
 pub use stream::{collect_response, stream_chat_completions, stream_messages, stream_responses};
 pub use types::RequestId;
+
+/// Ordered failover chain: provider name + the config used for it.
+/// Walked forward-only by the actor; a request starts at the entry whose
+/// config's `model` matches the request's model, else at index 0.
+pub type FailoverChain = Vec<(String, SamplerConfig)>;

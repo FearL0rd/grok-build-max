@@ -48,6 +48,10 @@ pub enum AuthScheme {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SamplerConfig {
     pub api_key: Option<String>,
+    /// Providers that need no key (Ollama, local OpenAI-compatible servers).
+    /// When true, a missing `api_key` does not skip this chain entry.
+    #[serde(default)]
+    pub keyless: bool,
     pub base_url: String,
     pub model: String,
     pub max_completion_tokens: Option<u32>,
@@ -142,6 +146,7 @@ impl Default for SamplerConfig {
     fn default() -> Self {
         Self {
             api_key: None,
+            keyless: false,
             base_url: String::new(),
             model: String::new(),
             max_completion_tokens: None,

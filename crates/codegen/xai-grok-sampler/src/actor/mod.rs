@@ -112,16 +112,31 @@ impl SamplerActor {
                     // previous one so we don't leak its task.
                     prev.cancel_token.cancel();
                 }
-                let effective_config = config
-                    .map(|b| *b)
-                    .unwrap_or_else(|| self.state.config.clone());
                 let event_tx = self.event_tx.clone();
                 let retry_policy = self.state.retry_policy.clone();
                 let request_inner = *request;
-                self.tasks.spawn(request_task::run_request_task(
+                // Per-request config overrides bypass the failover chain;
+                // without an override we walk the installed chain (or the
+                // plain config when no chain is set).
+                let chain: crate::FailoverChain = match config {
+                    Some(config) => vec![("provider".to_string(), *config)],
+                    None if !self.state.failover_chain.is_empty() => {
+                        self.state.failover_chain.clone()
+                    }
+                    None => vec![("provider".to_string(), self.state.config.clone())],
+                };
+                // Start at the selected model's entry so switching models
+                // does not replay providers earlier in the chain.
+                let start_index = request_inner
+                    .model
+                    .as_ref()
+                    .and_then(|m| chain.iter().position(|(_, c)| &c.model == m))
+                    .unwrap_or(0);
+                self.tasks.spawn(request_task::run_chain_task(
                     request_id,
                     request_inner,
-                    effective_config,
+                    chain,
+                    start_index,
                     retry_policy,
                     event_tx,
                     cancel_token,
@@ -133,6 +148,9 @@ impl SamplerActor {
             }
             SamplerCommand::UpdateConfig { config } => {
                 self.state.update_config(*config);
+            }
+            SamplerCommand::UpdateChain { chain } => {
+                self.state.update_chain(*chain);
             }
             SamplerCommand::IsActive { request_id, reply } => {
                 let _ = reply.send(self.state.active_requests.contains_key(&request_id));

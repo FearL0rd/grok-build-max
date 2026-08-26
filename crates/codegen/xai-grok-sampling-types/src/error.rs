@@ -206,6 +206,10 @@ pub enum SamplingError {
         triggers: Vec<String>,
         aborted_at_chunk: Option<u64>,
     },
+    /// Every entry in the failover chain failed. Terminal for the request —
+    /// never retried by the sampler itself.
+    #[error("all providers failed: {}", providers.join(" -> "))]
+    ProviderFailed { providers: Vec<String> },
 }
 
 /// Semantic `error.code` the server stamps on invalid-image rejections, on
@@ -388,7 +392,8 @@ impl SamplingError {
             | SamplingError::IdleTimeout { .. }
             | SamplingError::EmptyResponse { .. }
             | SamplingError::MaxTokensTruncation
-            | SamplingError::DoomLoopDetected { .. } => false,
+            | SamplingError::DoomLoopDetected { .. }
+            | SamplingError::ProviderFailed { .. } => false,
         }
     }
 
@@ -405,6 +410,7 @@ impl SamplingError {
             SamplingError::EmptyResponse { .. } => true,
             SamplingError::MaxTokensTruncation => false,
             SamplingError::DoomLoopDetected { .. } => true,
+            SamplingError::ProviderFailed { .. } => false,
         }
     }
 
