@@ -150,10 +150,8 @@ impl XaiProtoBuilder {
 
         for proto in protos {
             dep_seq += 1;
-            let dep_tmp = std::env::temp_dir().join(format!(
-                "xai-proto-deps-{}-{dep_seq}.d",
-                std::process::id(),
-            ));
+            let dep_tmp = std::env::temp_dir()
+                .join(format!("xai-proto-deps-{}-{dep_seq}.d", std::process::id(),));
             let dep_arg = if is_windows {
                 dep_tmp.to_str().context("temp path not UTF-8")?.to_string()
             } else {

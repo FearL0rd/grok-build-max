@@ -128,6 +128,9 @@ impl ParentPlan {
 pub(super) struct ParentAnchor {
     path: PathBuf,
     identity: FileIdentity,
+    /// Held open for the anchor's lifetime so the directory cannot be
+    /// deleted/replaced underneath us (matters on Windows). Never read.
+    #[allow(dead_code)]
     directory: fs::File,
 }
 
