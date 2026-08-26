@@ -1029,6 +1029,15 @@ pub struct DiagnosticsConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub crash_handler: Option<bool>,
 }
+/// Ordered provider failover chain (`[failover]` in config.toml). Names
+/// reference `[model.<name>]` keys plus the built-in Grok session entry.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct FailoverConfig {
+    /// Provider names tried in order when the selected model fails fatally
+    /// before producing output.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub order: Vec<String>,
+}
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ModelsConfig {
@@ -1368,6 +1377,8 @@ pub struct Config {
     pub cli: CliConfig,
     #[serde(default, skip_serializing)]
     pub models: ModelsConfig,
+    #[serde(default)]
+    pub failover: FailoverConfig,
     #[serde(default, skip_serializing)]
     pub harness: HarnessConfig,
     #[serde(default, skip_serializing)]
@@ -1777,6 +1788,7 @@ impl Default for Config {
             paths: PathsConfig::default(),
             cli: CliConfig::default(),
             models: ModelsConfig::default(),
+            failover: FailoverConfig::default(),
             harness: HarnessConfig::default(),
             relay: RelayConfig::default(),
             hub: HubConfig::default(),

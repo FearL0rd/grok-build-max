@@ -7539,3 +7539,29 @@ fn a_status_line_the_parser_could_not_read_in_full_reaches_grok_inspect() {
     );
     assert_eq!(cfg.ui.theme.as_deref(), Some("kanagawa"));
 }
+
+#[test]
+fn failover_section_round_trips() {
+    let raw = r#"
+[failover]
+order = ["grok", "openai", "ollama-local"]
+"#;
+    let cfg = Config::new_from_toml_cfg(&toml::from_str::<toml::Value>(raw).expect("parse"))
+        .expect("config");
+    assert_eq!(cfg.failover.order, vec!["grok", "openai", "ollama-local"]);
+
+    let out = toml::to_string_pretty(&Config::default()).unwrap();
+    assert!(
+        out.contains("failover"),
+        "default Config must serialize [failover] section"
+    );
+}
+
+#[test]
+fn missing_failover_section_defaults_to_empty() {
+    let cfg = Config::new_from_toml_cfg(
+        &toml::from_str::<toml::Value>("[model.grok]\nname = 'grok'\n").expect("parse"),
+    )
+    .expect("config");
+    assert!(cfg.failover.order.is_empty());
+}
