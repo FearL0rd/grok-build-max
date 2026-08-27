@@ -4045,6 +4045,10 @@ pub struct ConfigModelOverride {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub api_backend: Option<ApiBackend>,
+    /// Providers that need no key (Ollama, local OpenAI-compatible servers).
+    /// When true, `build_failover_chain` keeps the entry even with no api_key.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub keyless: bool,
     #[serde(default)]
     pub extra_headers: IndexMap<String, String>,
     #[serde(default)]

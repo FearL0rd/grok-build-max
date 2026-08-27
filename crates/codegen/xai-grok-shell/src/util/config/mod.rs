@@ -9,6 +9,7 @@ mod mcp;
 mod mcp_reenable;
 mod permissions;
 mod persist;
+mod providers_io;
 mod resolve;
 mod settings_writes;
 mod tips;
@@ -27,6 +28,7 @@ pub use mcp::*;
 pub(crate) use mcp_reenable::reenableable_disabled_stubs;
 pub use permissions::*;
 pub use persist::*;
+pub use providers_io::*;
 // `remote` extracted to the `xai-grok-config-types` crate (dependency inversion);
 // re-exported so `crate::util::config::{RemoteSettings, GoalRoleModel}` keep working.
 pub use resolve::*;

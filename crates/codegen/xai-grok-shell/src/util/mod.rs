@@ -4,6 +4,7 @@ pub(crate) mod dual_clock;
 pub mod grok_auth_credentials;
 pub mod hooks;
 pub mod limits;
+pub mod providers;
 pub(crate) mod subprocess;
 pub(crate) mod user_identity;
 
