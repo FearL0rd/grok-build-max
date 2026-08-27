@@ -93,11 +93,14 @@ fn classify_sampling_error(err: SamplingError) -> CompactFailure {
         }
         SamplingError::MaxTokensTruncation => true,
         // Loops are stochastic at sampling temperature; a retry may differ.
+        // Chain exhaustion may be a transient condition (rate limits clear);
+        // the retry loop's own budget bounds the re-walk.
         SamplingError::Http(_)
         | SamplingError::EventStreamError(_)
         | SamplingError::StreamError { .. }
         | SamplingError::EmptyResponse { .. }
-        | SamplingError::DoomLoopDetected { .. } => false,
+        | SamplingError::DoomLoopDetected { .. }
+        | SamplingError::ProviderFailed { .. } => false,
     };
     if deterministic {
         CompactFailure::Deterministic(acp_err)
@@ -555,6 +558,56 @@ pub(crate) async fn generate_session_compact(
                 stream_ms: timing.stream_ms(),
                 delta_count: timing.count,
                 itl_max_ms: timing.itl_max_ms(),
+            }
+        }
+        ApiBackend::Gemini => {
+            // Reuse the sampler's Gemini L2 transform instead of hand-rolling
+            // a chunk loop; compaction latency metrics stay uninstrumented.
+            let request = ConversationRequest {
+                items: chat_history,
+                tools,
+                hosted_tools,
+                model: Some(sampling_config.model.to_owned()),
+                temperature: Some(1.0),
+                x_grok_conv_id: Some(session_id.to_string()),
+                x_grok_req_id: Some(format!("xai-compact-{}", uuid::Uuid::new_v4())),
+                x_grok_session_id: Some(session_id.to_string()),
+                x_grok_agent_id: Some(xai_grok_telemetry::id::agent_id()),
+                ..Default::default()
+            };
+            let stream_result =
+                await_unless_cancelled(cancel, client.conversation_stream_gemini(request)).await?;
+            let (raw, metadata) = match stream_result {
+                Ok((s, m)) => (s, m),
+                Err(e) => return Err(classify_sampling_error(e)),
+            };
+            let request_id = xai_grok_sampler::RequestId::random();
+            let events = xai_grok_sampler::stream_gemini(raw, metadata, request_id, idle_timeout);
+            let collected =
+                await_unless_cancelled(cancel, xai_grok_sampler::collect_response(events)).await?;
+            let (response, _metrics) = match collected {
+                Ok(pair) => pair,
+                // collect_response surfaces the serialized error info, not
+                // the rich SamplingError classify_sampling_error expects.
+                Err(info) => {
+                    return Err(CompactFailure::Transient(
+                        acp::Error::internal_error()
+                            .data(format!("compact failed: {}", info.message)),
+                    ));
+                }
+            };
+            let stop_reason = response.stop_reason;
+            CompactOutput {
+                content: response.assistant_text(),
+                stop_reason: stop_reason.map(|sr| sr.as_str().to_string()),
+                truncated: matches!(
+                    stop_reason,
+                    Some(xai_grok_sampling_types::StopReason::Length)
+                ),
+                ttft_ms: None,
+                stream_ms: None,
+                delta_count: 0,
+                itl_max_ms: None,
             }
         }
         ApiBackend::Responses => {

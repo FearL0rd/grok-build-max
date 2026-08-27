@@ -485,6 +485,7 @@ impl SessionActor {
         );
         SamplingConfig {
             api_key,
+            keyless: false,
             base_url: cfg.base_url,
             model: cfg.model,
             max_completion_tokens: cfg.max_completion_tokens,

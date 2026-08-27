@@ -2946,6 +2946,43 @@ impl SessionActor {
                 )
                 .await;
             }
+            SamplingEvent::ProviderSkipped { name, reason, .. } => {
+                xai_grok_telemetry::unified_log::info(
+                    "shell.turn.provider_skipped",
+                    Some(self.session_info.id.0.as_ref()),
+                    Some(serde_json::json!({
+                        "provider": name.as_ref(),
+                        "reason": reason.as_ref(),
+                    })),
+                );
+            }
+            SamplingEvent::ProviderRolledOver {
+                from, to, reason, ..
+            } => {
+                xai_grok_telemetry::unified_log::warn(
+                    "shell.turn.provider_rolled_over",
+                    Some(self.session_info.id.0.as_ref()),
+                    Some(serde_json::json!({
+                        "from": from.as_ref(),
+                        "to": to.as_ref(),
+                        "reason": crate::util::truncate(&reason, 300),
+                    })),
+                );
+            }
+            SamplingEvent::ProviderFailed {
+                request_id,
+                providers,
+            } => {
+                xai_grok_telemetry::unified_log::error(
+                    "shell.turn.provider_chain_exhausted",
+                    Some(self.session_info.id.0.as_ref()),
+                    Some(serde_json::json!({
+                        "sampler_request_id": request_id.as_str(),
+                        "providers": providers,
+                    })),
+                );
+                self.signals_handle().record_error_typed("provider_failed");
+            }
         }
     }
     /// Model-facing rejection for a non-plan-file edit while plan mode is

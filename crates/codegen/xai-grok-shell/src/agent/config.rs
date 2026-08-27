@@ -5254,6 +5254,7 @@ pub(crate) fn sampling_config_for_model(
     );
     SamplerConfig {
         api_key: credentials.api_key,
+        keyless: false,
         model: model_name,
         base_url: credentials.base_url,
         max_completion_tokens,

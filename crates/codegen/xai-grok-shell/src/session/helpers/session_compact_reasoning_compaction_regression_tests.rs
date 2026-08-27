@@ -169,6 +169,7 @@ fn assert_preserved_compaction_body(body: &serde_json::Value) {
 fn test_config(base_url: &str) -> SamplerConfig {
     SamplerConfig {
         api_key: Some("test-api-key".to_string()),
+        keyless: false,
         base_url: base_url.to_string(),
         model: "test-model".to_string(),
         max_completion_tokens: Some(1000),

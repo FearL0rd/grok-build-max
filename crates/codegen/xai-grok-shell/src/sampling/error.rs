@@ -180,6 +180,12 @@ pub(crate) fn map_sampling_err_to_acp(err: SamplingError) -> acp::Error {
         SamplingError::IdleTimeout { elapsed_secs } => acp::Error::internal_error().data(format!(
             "No response from model for {elapsed_secs}s — the model may be stuck"
         )),
+        // The failover chain walked every entry; nothing succeeded. Tell the
+        // user which providers were tried so they can fix keys/config.
+        SamplingError::ProviderFailed { providers } => acp::Error::internal_error().data(format!(
+            "all configured providers failed: {}",
+            providers.join(", ")
+        )),
         // Recovery consumes these inside the sampler's retry loop; a stray
         // terminal one still renders its labels.
         SamplingError::DoomLoopDetected { .. } => {

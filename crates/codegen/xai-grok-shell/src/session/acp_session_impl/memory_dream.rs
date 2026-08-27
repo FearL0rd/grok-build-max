@@ -817,6 +817,14 @@ impl SessionActor {
                 let events = xai_grok_sampler::stream_messages(raw, meta, request_id, idle_timeout);
                 xai_grok_sampler::collect_response(events).await
             }
+            crate::sampling::ApiBackend::Gemini => {
+                let (raw, meta) = sampling_client
+                    .conversation_stream_gemini(request)
+                    .await
+                    .map_err(|e| format!("rewrite stream failed: {e}"))?;
+                let events = xai_grok_sampler::stream_gemini(raw, meta, request_id, idle_timeout);
+                xai_grok_sampler::collect_response(events).await
+            }
         };
 
         match result {

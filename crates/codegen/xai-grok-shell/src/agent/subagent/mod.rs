@@ -742,6 +742,7 @@ async fn read_parent_sampling_config(
             );
             let inherited = xai_grok_sampler::SamplerConfig {
                 api_key: creds.api_key,
+                keyless: false,
                 base_url: cfg.base_url,
                 model: cfg.model.clone(),
                 max_completion_tokens: cfg.max_completion_tokens,
