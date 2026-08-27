@@ -1,4 +1,5 @@
 pub mod config;
+pub mod copilot_headers;
 pub(crate) mod dual_clock;
 pub mod grok_auth_credentials;
 pub mod hooks;
