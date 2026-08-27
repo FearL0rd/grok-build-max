@@ -2430,6 +2430,7 @@ mod tests {
             crate::ApiBackend::ChatCompletions,
             crate::ApiBackend::Responses,
             crate::ApiBackend::Messages,
+            crate::ApiBackend::Gemini,
         ] {
             let on_wire = match backend {
                 crate::ApiBackend::Responses => {
@@ -2452,6 +2453,9 @@ mod tests {
                         .get("prompt_cache_key")
                         .is_some()
                 }
+                // Gemini's native mapping lives in the sampler; no
+                // prompt_cache_key field exists on the wire.
+                crate::ApiBackend::Gemini => false,
             };
             assert_eq!(
                 on_wire,

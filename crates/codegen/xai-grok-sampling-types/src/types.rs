@@ -1018,6 +1018,8 @@ pub enum ApiBackend {
     Responses,
     /// Use the Anthropic Messages API (/v1/messages)
     Messages,
+    /// Use the Google Gemini native generateContent API (SSE streaming).
+    Gemini,
 }
 
 impl ApiBackend {
