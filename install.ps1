@@ -52,10 +52,13 @@ if (-not (Get-Command protoc -ErrorAction SilentlyContinue) -and -not $env:PROTO
   if (-not (Test-Path $ProtocExe)) {
     $Zip = Join-Path $env:TEMP "protoc-$ProtocVersion-win64.zip"
     Write-Host "protoc not found - downloading protoc $ProtocVersion for Windows..."
-    Invoke-WebRequest -UseBasicParsing `
-      "https://github.com/protocolbuffers/protobuf/releases/download/v$ProtocVersion/protoc-$ProtocVersion-win64.zip" `
-      -OutFile $Zip
-    if ($LASTEXITCODE -ne 0) { Fail "protoc download failed (exit $LASTEXITCODE)" }
+    try {
+      Invoke-WebRequest -UseBasicParsing -ErrorAction Stop `
+        "https://github.com/protocolbuffers/protobuf/releases/download/v$ProtocVersion/protoc-$ProtocVersion-win64.zip" `
+        -OutFile $Zip
+    } catch {
+      Fail "protoc download failed: $($_.Exception.Message)"
+    }
     if (Test-Path $ProtocHome) { Remove-Item -Recurse -Force $ProtocHome }
     Expand-Archive -Path $Zip -DestinationPath $ProtocHome -Force
     Remove-Item -Force $Zip
