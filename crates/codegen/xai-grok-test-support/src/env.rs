@@ -81,7 +81,7 @@ fn target_dir() -> PathBuf {
 fn local_grok_binary_path() -> PathBuf {
     target_dir()
         .join("debug")
-        .join(format!("xai-grok-pager{}", std::env::consts::EXE_SUFFIX))
+        .join(format!("grokmax{}", std::env::consts::EXE_SUFFIX))
 }
 
 fn ensure_local_grok_binary(binary: &Path) {
@@ -120,7 +120,7 @@ fn ensure_local_grok_binary(binary: &Path) {
     );
 }
 
-/// Resolve grok binary: `GROK_BINARY` env (CI) or a locally built `xai-grok-pager` binary.
+/// Resolve grok binary: `GROK_BINARY` env (CI) or a locally built `grokmax` binary.
 pub fn grok_binary() -> PathBuf {
     if let Ok(path) = std::env::var("GROK_BINARY") {
         let p = PathBuf::from(path);
@@ -130,7 +130,7 @@ pub fn grok_binary() -> PathBuf {
         return std::path::absolute(&p).unwrap_or(p);
     }
 
-    if let Ok(path) = std::env::var("CARGO_BIN_EXE_xai-grok-pager") {
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_grokmax") {
         let p = PathBuf::from(path);
         if p.exists() {
             return p;
