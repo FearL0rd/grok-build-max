@@ -51,14 +51,23 @@ if (-not (Get-Command protoc -ErrorAction SilentlyContinue) -and -not $env:PROTO
   $ProtocExe = Join-Path $ProtocHome 'bin\protoc.exe'
   if (-not (Test-Path $ProtocExe)) {
     $Zip = Join-Path $env:TEMP "protoc-$ProtocVersion-win64.zip"
+    $ProtocUrl = "https://github.com/protocolbuffers/protobuf/releases/download/v$ProtocVersion/protoc-$ProtocVersion-win64.zip"
     Write-Host "protoc not found - downloading protoc $ProtocVersion for Windows..."
-    try {
-      Invoke-WebRequest -UseBasicParsing -ErrorAction Stop `
-        "https://github.com/protocolbuffers/protobuf/releases/download/v$ProtocVersion/protoc-$ProtocVersion-win64.zip" `
-        -OutFile $Zip
-    } catch {
-      Fail "protoc download failed: $($_.Exception.Message)"
+    $Downloaded = $false
+    # curl.exe ships with Windows 10+ and reports exit codes natively.
+    if (Get-Command curl.exe -ErrorAction SilentlyContinue) {
+      curl.exe -fsSL -o $Zip $ProtocUrl
+      $Downloaded = ($LASTEXITCODE -eq 0)
     }
+    if (-not $Downloaded) {
+      try {
+        Invoke-WebRequest -UseBasicParsing -ErrorAction Stop $ProtocUrl -OutFile $Zip
+        $Downloaded = $true
+      } catch {
+        Fail "protoc download failed: $($_.Exception.Message) - or install protoc manually (winget install protobuf / choco install protoc / scoop install protobuf) and re-run"
+      }
+    }
+    if (-not $Downloaded) { Fail "protoc download failed (curl exit $LASTEXITCODE) - or install protoc manually and re-run" }
     if (Test-Path $ProtocHome) { Remove-Item -Recurse -Force $ProtocHome }
     Expand-Archive -Path $Zip -DestinationPath $ProtocHome -Force
     Remove-Item -Force $Zip
