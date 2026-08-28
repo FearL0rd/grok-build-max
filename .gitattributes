@@ -1,0 +1,4 @@
+# Keep the shell installer executable on unix regardless of the cloner's
+# core.autocrlf setting.
+install.sh text eol=lf
+install.ps1 text eol=crlf
