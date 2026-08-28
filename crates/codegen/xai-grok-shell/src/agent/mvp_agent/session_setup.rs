@@ -540,6 +540,35 @@ impl MvpAgent {
         if local_workspace_intent_present(arguments.meta.as_ref()) {
             self.mark_local_workspace_bound(session_id.clone());
         }
+        // Seed the provider failover chain from config.toml so rollover is
+        // armed from the session's first prompt.
+        {
+            let session_key = self.auth_manager.current_or_expired().map(|a| a.key.clone());
+            let client_version = self
+                .client_version()
+                .unwrap_or_else(|| "grok-build".to_owned());
+            let (chain, warnings) = {
+                let cfg = self.cfg.borrow();
+                crate::util::providers::build_failover_chain(
+                    &cfg,
+                    session_key.as_deref(),
+                    &client_version,
+                )
+            };
+            for warning in &warnings {
+                tracing::warn!(session_id = %session_id.0, "failover chain: {warning}");
+            }
+            if !chain.is_empty()
+                && let Some(handle) = self.session_handle_waiting_for_load(&session_id).await
+            {
+                let (responds_to, rx) = tokio::sync::oneshot::channel();
+                let _ = handle.cmd_tx.send(SessionCommand::UpdateFailoverChain {
+                    chain,
+                    responds_to,
+                });
+                let _ = rx.await;
+            }
+        }
         self.maybe_spawn_interactive_trust_prompt(
             &session_id,
             cwd.as_path(),

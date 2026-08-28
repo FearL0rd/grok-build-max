@@ -911,6 +911,15 @@ pub enum SessionCommand {
         commit: Option<String>,
         branch: Option<String>,
     },
+    /// Install a fresh provider failover chain on the session's sampler.
+    ///
+    /// Sent at session start (seeded from `config.toml`) and by the
+    /// `x.ai/providers/reload` extension request after a `/providers` panel
+    /// mutation, so changes apply without restarting the session.
+    UpdateFailoverChain {
+        chain: xai_grok_sampler::FailoverChain,
+        responds_to: oneshot::Sender<()>,
+    },
 }
 #[cfg(test)]
 mod cancellation_category_meta_tests {

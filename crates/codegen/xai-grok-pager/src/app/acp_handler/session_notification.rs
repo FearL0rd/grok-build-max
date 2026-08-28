@@ -238,7 +238,10 @@ pub(super) fn handle_session_notification_with_origin(
         | XaiSessionUpdate::ImageDropped { .. }
         | XaiSessionUpdate::MemoryFlushCompleted { .. }
         | XaiSessionUpdate::MemoryDreamCompleted { .. }
-        | XaiSessionUpdate::MemorySessionSaved { .. }) => {
+        | XaiSessionUpdate::MemorySessionSaved { .. }
+        | XaiSessionUpdate::ProviderSkipped { .. }
+        | XaiSessionUpdate::ProviderRolledOver { .. }
+        | XaiSessionUpdate::ProviderFailed { .. }) => {
             let changed = apply_session_event(
                 update,
                 &mut agent.session,
@@ -248,6 +251,11 @@ pub(super) fn handle_session_notification_with_origin(
             if let XaiSessionUpdate::AutoCompactCompleted { tokens_after, .. } = update {
                 refresh_context_used(agent, *tokens_after);
                 agent.todo.update_todos(Vec::new());
+            }
+            if let XaiSessionUpdate::ProviderRolledOver { to, .. } = update
+                && let Some(ref mut modal) = agent.providers_modal
+            {
+                modal.last_rollover = Some(to.clone());
             }
             changed
         }
@@ -1470,6 +1478,23 @@ pub(super) fn apply_session_event(
             let message = notes.join("\n");
             tracing::info!("Image dropped: {message}");
             scrollback.push_block(RenderBlock::system(message));
+            true
+        }
+        XaiSessionUpdate::ProviderSkipped { name, reason } => {
+            scrollback.push_block(RenderBlock::system(format!("⏭ skipped {name}: {reason}")));
+            true
+        }
+        XaiSessionUpdate::ProviderRolledOver { from, to, reason } => {
+            scrollback.push_block(RenderBlock::system(format!(
+                "↪ rolled over {from} → {to} ({reason})"
+            )));
+            true
+        }
+        XaiSessionUpdate::ProviderFailed { providers } => {
+            scrollback.push_block(RenderBlock::system(format!(
+                "✗ all providers failed: {}",
+                providers.join(", ")
+            )));
             true
         }
         _ => false,

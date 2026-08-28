@@ -79,6 +79,53 @@ impl AgentView {
         }
     }
 
+    // -- /providers failover panel input handling --
+
+    pub(super) fn handle_providers_modal_key(
+        &mut self,
+        key: &crossterm::event::KeyEvent,
+    ) -> InputOutcome {
+        use crate::views::providers_modal::{ProvidersOp, ProvidersOutcome};
+        let Some(ref mut state) = self.providers_modal else {
+            return InputOutcome::Unchanged;
+        };
+        match crate::views::providers_modal::handle_providers_key(state, key) {
+            ProvidersOutcome::Close => {
+                self.providers_modal = None;
+                InputOutcome::Changed
+            }
+            ProvidersOutcome::Op(op) => {
+                let action = match op {
+                    ProvidersOp::Upsert {
+                        name,
+                        base_url,
+                        api_key,
+                        model,
+                        keyless,
+                    } => Action::ProvidersUpsert {
+                        name,
+                        base_url,
+                        api_key,
+                        model,
+                        keyless,
+                    },
+                    ProvidersOp::Remove { name } => Action::ProvidersRemove { name },
+                    ProvidersOp::Reorder { order } => Action::ProvidersReorder { order },
+                };
+                InputOutcome::Action(action)
+            }
+            ProvidersOutcome::Changed => InputOutcome::Changed,
+            ProvidersOutcome::Unchanged => InputOutcome::Unchanged,
+        }
+    }
+
+    pub(super) fn handle_providers_modal_paste(&mut self, text: &str) -> InputOutcome {
+        match self.providers_modal.as_mut() {
+            Some(state) => crate::views::providers_modal::handle_providers_paste(state, text),
+            None => InputOutcome::Unchanged,
+        }
+    }
+
     pub(super) fn handle_agents_modal_paste(&mut self, text: &str) -> InputOutcome {
         let Some(ref mut state) = self.agents_modal else {
             return InputOutcome::Unchanged;

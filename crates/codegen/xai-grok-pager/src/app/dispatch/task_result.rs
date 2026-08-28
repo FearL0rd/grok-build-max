@@ -48,7 +48,8 @@ use super::status::{
 };
 use super::transcript::{
     handle_hooks_list_loaded, handle_marketplace_list_loaded, handle_marketplace_updates_available,
-    handle_mcp_toggle_done, handle_plugins_list_loaded, handle_skills_toggle_done,
+    handle_mcp_toggle_done, handle_plugins_list_loaded, handle_providers_done,
+    handle_skills_toggle_done,
 };
 use super::turn::handle_bg_task_killed;
 use crate::app::actions::{
@@ -845,6 +846,9 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
         }
         TaskResult::McpToggleDone { agent_id, result } => {
             handle_mcp_toggle_done(app, agent_id, result)
+        }
+        TaskResult::ProvidersDone { agent_id, result } => {
+            handle_providers_done(app, agent_id, result)
         }
         TaskResult::MarketplaceUpdatesAvailable { agent_id, updates } => {
             handle_marketplace_updates_available(app, agent_id, updates)

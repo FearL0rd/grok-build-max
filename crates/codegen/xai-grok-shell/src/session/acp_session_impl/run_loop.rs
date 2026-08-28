@@ -648,6 +648,16 @@ pub(super) async fn run_session(
                             let updated_model_id = session.handle_set_session_model(sampling_config, use_concise, is_family_switch, apply_prompt_override, skip_prompt_rewrite, auto_compact_threshold_percent).await;
                             let _ = responds_to.send(updated_model_id);
                         }
+                        SessionCommand::UpdateFailoverChain { chain, responds_to } => {
+                            tracing::info!(
+                                target: SESSION_LOG,
+                                session_id = %session.session_info.id,
+                                chain_len = chain.len(),
+                                "UPDATE_FAILOVER_CHAIN: installing provider chain"
+                            );
+                            session.sampler_handle.update_chain(chain);
+                            let _ = responds_to.send(());
+                        }
                         SessionCommand::RebuildAgentForDefinition { definition, responds_to } => {
                             let outcome = session.handle_rebuild_agent_for_definition(definition).await;
                             let _ = responds_to.send(outcome);

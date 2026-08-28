@@ -462,6 +462,28 @@ pub enum SessionUpdate {
     },
     /// Notification that a retry is in progress due to a transient error.
     RetryState(RetryState),
+    /// Failover chain walked past a provider without trying it (no key, or
+    /// entry unresolvable).
+    ProviderSkipped {
+        /// Provider config name (e.g. `"openai"`).
+        name: String,
+        /// Why it was skipped.
+        reason: String,
+    },
+    /// The active provider failed before any output and the next one took over.
+    ProviderRolledOver {
+        /// Provider that failed.
+        from: String,
+        /// Provider now serving the request.
+        to: String,
+        /// Why the first provider failed.
+        reason: String,
+    },
+    /// Every provider in the failover chain failed before any output.
+    ProviderFailed {
+        /// All provider names that were attempted, in order.
+        providers: Vec<String>,
+    },
     /// Auto-compact is starting due to context window threshold
     AutoCompactStarted {
         /// Current token usage
@@ -1601,6 +1623,33 @@ mod tests {
         assert_eq!(json["context_usage_pct"], 35);
         assert_eq!(json["tools_used"], serde_json::json!(["bash", "grep"]));
         assert_eq!(json["error_count"], 1);
+    }
+
+    #[test]
+    fn provider_failover_updates_roundtrip_through_json() {
+        let skipped = SessionUpdate::ProviderSkipped {
+            name: "openai".into(),
+            reason: "no api_key configured".into(),
+        };
+        let rolled = SessionUpdate::ProviderRolledOver {
+            from: "grok".into(),
+            to: "anthropic".into(),
+            reason: "429 rate limited".into(),
+        };
+        let failed = SessionUpdate::ProviderFailed {
+            providers: vec!["grok".into(), "openai".into()],
+        };
+        for update in [skipped, rolled, failed] {
+            let json = serde_json::to_value(&update).unwrap();
+            let parsed: SessionUpdate = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(update, parsed);
+            assert!(
+                json["sessionUpdate"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("provider_")
+            );
+        }
     }
 
     #[test]

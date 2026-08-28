@@ -374,6 +374,27 @@ pub enum Action {
     /// Open the agents modal (listing all agent definitions).
     /// Optionally opens directly on a specific tab.
     OpenConfigAgentsModal(Option<crate::views::agents_modal::AgentsTab>),
+    /// Open the `/providers` failover-chain panel.
+    OpenProvidersModal,
+    /// Write a `[model.<name>]` entry (add or edit) via the `/providers`
+    /// panel, then hot-reload the session's failover chain.
+    ProvidersUpsert {
+        name: String,
+        base_url: String,
+        api_key: Option<String>,
+        model: String,
+        keyless: bool,
+    },
+    /// Remove a `[model.<name>]` entry (and its order slot) via the
+    /// `/providers` panel, then hot-reload the chain.
+    ProvidersRemove {
+        name: String,
+    },
+    /// Rewrite `[failover].order` after a swap in the `/providers` panel,
+    /// then hot-reload the chain.
+    ProvidersReorder {
+        order: Vec<String>,
+    },
     /// Trigger OAuth for an MCP server from the modal.
     McpAuthTrigger {
         server_name: String,
@@ -1937,6 +1958,29 @@ pub enum Effect {
         name: String,
         config: Box<xai_grok_shell::util::config::McpServerConfig>,
     },
+    /// Write `[model.<name>]` + `[failover].order` (comment-preserving) and
+    /// hot-reload the session chain via `x.ai/providers/reload`.
+    ProvidersUpsert {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+        name: String,
+        base_url: String,
+        api_key: Option<String>,
+        model: String,
+        keyless: bool,
+    },
+    /// Remove `[model.<name>]` + its order slot, then hot-reload the chain.
+    ProvidersRemove {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+        name: String,
+    },
+    /// Rewrite `[failover].order`, then hot-reload the chain.
+    ProvidersReorder {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+        order: Vec<String>,
+    },
     /// Delete an MCP server via x.ai/mcp/delete.
     DeleteMcpServer {
         agent_id: AgentId,
@@ -2728,6 +2772,11 @@ pub enum TaskResult {
     },
     /// Live MCP toggle completed.
     McpToggleDone {
+        agent_id: AgentId,
+        result: Result<(), String>,
+    },
+    /// A `/providers` panel mutation was applied (config write + live reload).
+    ProvidersDone {
         agent_id: AgentId,
         result: Result<(), String>,
     },

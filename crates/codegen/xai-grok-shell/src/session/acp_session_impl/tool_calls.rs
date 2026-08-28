@@ -2955,6 +2955,11 @@ impl SessionActor {
                         "reason": reason.as_ref(),
                     })),
                 );
+                self.send_xai_notification(XaiSessionUpdate::ProviderSkipped {
+                    name: name.to_string(),
+                    reason: reason.to_string(),
+                })
+                .await;
             }
             SamplingEvent::ProviderRolledOver {
                 from, to, reason, ..
@@ -2968,6 +2973,12 @@ impl SessionActor {
                         "reason": crate::util::truncate(&reason, 300),
                     })),
                 );
+                self.send_xai_notification(XaiSessionUpdate::ProviderRolledOver {
+                    from: from.to_string(),
+                    to: to.to_string(),
+                    reason: crate::util::truncate(&reason, 300).to_owned(),
+                })
+                .await;
             }
             SamplingEvent::ProviderFailed {
                 request_id,
@@ -2982,6 +2993,10 @@ impl SessionActor {
                     })),
                 );
                 self.signals_handle().record_error_typed("provider_failed");
+                self.send_xai_notification(XaiSessionUpdate::ProviderFailed {
+                    providers: providers.iter().map(|p| p.to_string()).collect(),
+                })
+                .await;
             }
         }
     }

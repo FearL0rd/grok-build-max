@@ -3119,6 +3119,40 @@ pub(crate) fn execute(
                     }
                 });
         }
+        Effect::ProvidersUpsert { agent_id, session_id, name, base_url, api_key, model, keyless } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                let write = xai_grok_shell::util::config::upsert_model_entry(
+                    &name,
+                    xai_grok_shell::util::config::ModelFields {
+                        base_url,
+                        api_key,
+                        api_backend: None,
+                        model,
+                        temperature: None,
+                        max_completion_tokens: None,
+                        keyless,
+                        extra_headers: vec![],
+                    },
+                )
+                .await;
+                finish_providers_op(&tx, session_id, agent_id, write).await
+            });
+        }
+        Effect::ProvidersRemove { agent_id, session_id, name } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                let write = xai_grok_shell::util::config::remove_model_entry(&name).await;
+                finish_providers_op(&tx, session_id, agent_id, write).await
+            });
+        }
+        Effect::ProvidersReorder { agent_id, session_id, order } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                let write = xai_grok_shell::util::config::reorder_failover(order).await;
+                finish_providers_op(&tx, session_id, agent_id, write).await
+            });
+        }
         Effect::ToggleMcpServer { agent_id, session_id, server_name, enabled } => {
             let tx = acp_tx.clone();
             let is_api_key_auth = session_flags.is_api_key_auth;

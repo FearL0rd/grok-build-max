@@ -36,6 +36,7 @@ impl AgentView {
             || self.active_modal.is_some()
             || self.extensions_modal.is_some()
             || self.agents_modal.is_some()
+            || self.providers_modal.is_some()
             || self.persona_detail.is_some()
             || self.scrollback_search.is_some()
             || self.line_viewer.is_some()
@@ -78,6 +79,7 @@ impl AgentView {
             && self.gboom.is_none()
             && self.extensions_modal.is_none()
             && self.agents_modal.is_none()
+            && self.providers_modal.is_none()
             && self.persona_detail.is_none()
             && self.btw_state.is_none()
             && self.scrollback_search.is_none()
@@ -113,6 +115,7 @@ impl AgentView {
             || self.video_viewer.is_some()
             || self.image_viewer.is_some()
             || self.agents_modal.is_some()
+            || self.providers_modal.is_some()
             || self.persona_detail.is_some()
             || self.block_viewer.is_some()
     }
@@ -205,6 +208,7 @@ impl AgentView {
             && self.inline_edit.is_none()
             && !self.is_subagent_view
             && self.agents_modal.is_none()
+            && self.providers_modal.is_none()
             && self.persona_detail.is_none()
             && self.no_esc_consumer_pending()
             && self.no_input_overlay_pending()
@@ -781,6 +785,18 @@ impl AgentView {
                 }
                 Event::Mouse(mouse) => self.handle_agents_modal_mouse(mouse),
                 Event::Paste(text) => self.handle_agents_modal_paste(text),
+                _ => InputOutcome::Changed,
+            };
+        }
+        if self.providers_modal.is_some() {
+            return match ev {
+                Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    if registry.lookup(key, When::Always).is_some() {
+                        return InputOutcome::Unchanged;
+                    }
+                    self.handle_providers_modal_key(key)
+                }
+                Event::Paste(text) => self.handle_providers_modal_paste(text),
                 _ => InputOutcome::Changed,
             };
         }

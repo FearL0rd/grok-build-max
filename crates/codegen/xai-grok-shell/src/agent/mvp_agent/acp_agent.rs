@@ -2504,6 +2504,9 @@ impl acp::Agent for MvpAgent {
             s if s.starts_with("x.ai/hooks/") => {
                 crate::extensions::hooks::handle(self, &args).await
             }
+            s if s.starts_with("x.ai/providers/") => {
+                crate::extensions::providers::handle(self, &args).await
+            }
             s if s.starts_with("x.ai/hunk-tracker/") => {
                 let ops = self.resolve_workspace_ops()?;
                 crate::extensions::hunk_tracker::handle(self, &ops, &args).await

@@ -22,6 +22,7 @@ pub mod pr;
 pub mod privacy;
 pub mod prompt_history;
 pub mod prompt_meta;
+pub mod providers;
 pub mod recap;
 pub mod repair;
 pub mod rewind;

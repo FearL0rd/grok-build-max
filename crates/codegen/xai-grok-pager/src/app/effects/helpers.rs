@@ -82,6 +82,34 @@ pub(super) const CLIPBOARD_PROBE_TIMEOUT_SECS: u64 = 10;
 /// Picker search debounce ([`Effect::DebounceSessionSearch`]):
 /// long enough to coalesce a typing burst, short enough to feel live.
 pub(super) const SESSION_SEARCH_DEBOUNCE_MS: u64 = 250;
+/// Persist a `/providers` panel mutation (the config write is already
+/// awaited), then hot-reload the session's failover chain. The reload
+/// response payload is ignored — the panel rebuilds from local state.
+pub(super) async fn finish_providers_op(
+    tx: &AcpAgentTx,
+    session_id: acp::SessionId,
+    agent_id: AgentId,
+    write: anyhow::Result<()>,
+) -> TaskResult {
+    let result = if let Err(e) = write {
+        Err(sanitize_user_error(&format!("couldn't save provider config: {e}")))
+    } else {
+        let req = acp::ExtRequest::new(
+            "x.ai/providers/reload",
+            serde_json::value::to_raw_value(&serde_json::json!({
+                "session_id": session_id.0.to_string(),
+            }))
+            .expect("serialize providers/reload params")
+            .into(),
+        );
+        match acp_send(req, tx).await {
+            Ok(_) => Ok(()),
+            Err(e) => Err(sanitize_user_error(&format!("couldn't reload providers: {e}"))),
+        }
+    };
+    TaskResult::ProvidersDone { agent_id, result }
+}
+
 /// Run the post-CTA-install `x.ai/mcp/list` read (uncached, which also nudges
 /// the shell to retry auth-required servers) and map it into a
 /// `TaskResult::PluginCtaMcpsLoaded`. Shared by the immediate fetch and the

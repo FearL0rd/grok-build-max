@@ -1310,6 +1310,9 @@ pub struct AgentView {
     /// Active agents modal popup. When `Some`, blocks all input and
     /// renders as a centered overlay. Opened by `/config-agents` or `/agents`.
     pub(crate) agents_modal: Option<crate::views::agents_modal::AgentsModalState>,
+    /// Active `/providers` failover-order panel. When `Some`, blocks all
+    /// input and renders as a centered overlay.
+    pub(crate) providers_modal: Option<crate::views::providers_modal::ProvidersModalState>,
     pub(crate) persona_detail: Option<crate::views::persona_detail::PersonaDetailState>,
     /// Active /btw side question overlay. When `Some`, renders as a dismissible
     /// overlay and captures keyboard input (Esc/Enter/Space to dismiss).

@@ -575,6 +575,34 @@ pub(super) fn dispatch_open_config_agents_modal(
     vec![]
 }
 
+/// Open the `/providers` failover-order panel, seeded from the effective
+/// `config.toml` (same chain construction the session sampler uses).
+pub(super) fn dispatch_open_providers_modal(app: &mut AppView) -> Vec<Effect> {
+    let ActiveView::Agent(id) = app.active_view else {
+        toast_session_only_slash(app, "providers");
+        return vec![];
+    };
+    let Some(agent) = app.agents.get_mut(&id) else {
+        return vec![];
+    };
+
+    // Mutual exclusivity with the other center overlays.
+    agent.extensions_modal = None;
+    agent.agents_modal = None;
+
+    let active_model = agent
+        .session
+        .models
+        .current
+        .as_ref()
+        .map(|m| m.0.to_string())
+        .unwrap_or_default();
+    agent.providers_modal = Some(crate::views::providers_modal::build_providers_modal_state(
+        &active_model,
+    ));
+    vec![]
+}
+
 /// `agentType` / `agent_type` from a catalog `ModelInfo` meta blob.
 fn model_agent_type_from_info(info: &agent_client_protocol::ModelInfo) -> Option<String> {
     let meta = info.meta.as_ref()?;
@@ -752,6 +780,36 @@ pub(super) fn handle_mcp_toggle_done(
         session_id,
         cache: false,
     }]
+}
+
+pub(super) fn handle_providers_done(
+    app: &mut AppView,
+    agent_id: AgentId,
+    result: Result<(), String>,
+) -> Vec<Effect> {
+    let Some(agent) = app.agents.get_mut(&agent_id) else {
+        return vec![];
+    };
+    match result {
+        Err(e) => agent.show_toast(&e),
+        Ok(()) => {
+            let Some(ref mut modal) = agent.providers_modal else {
+                return vec![];
+            };
+            let rebuilt = crate::views::providers_modal::build_providers_modal_state(
+                &agent
+                    .session
+                    .models
+                    .current_model_name()
+                    .unwrap_or_else(|| "grok".to_string()),
+            );
+            modal.entries = rebuilt.entries;
+            if modal.selected >= modal.entries.len() {
+                modal.selected = modal.entries.len().saturating_sub(1);
+            }
+        }
+    }
+    vec![]
 }
 
 pub(super) fn handle_marketplace_updates_available(
