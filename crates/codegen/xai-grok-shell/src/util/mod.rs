@@ -6,6 +6,7 @@ pub mod hooks;
 pub mod limits;
 pub mod providers;
 pub(crate) mod subprocess;
+pub(crate) mod text_sanitize;
 pub(crate) mod user_identity;
 
 // The foundation utilities live in `xai-grok-shell-base` (upstream of this

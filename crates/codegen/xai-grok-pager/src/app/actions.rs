@@ -270,6 +270,12 @@ pub enum Action {
         server: Option<SharedQueueTarget>,
         text: String,
     },
+    /// Resolution of the hard-modal blocked-prompt card.
+    PromptBlockAnswered {
+        /// The local queue row the blocked prompt was requeued into.
+        row_id: u64,
+        choice: PromptBlockChoice,
+    },
     /// Focus the prompt pane.
     FocusPrompt,
     /// Focus the scrollback pane (leave prompt).
@@ -1172,6 +1178,13 @@ mod permission_mode_kind_tests {
         }
     }
 }
+/// What the user chose on the hard-modal blocked-prompt card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptBlockChoice {
+    Edit,
+    Resend,
+    Discard,
+}
 /// What the user chose on the `/feedback` trace-consent question.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FeedbackTraceChoice {
@@ -1552,6 +1565,11 @@ pub enum Effect {
     },
     /// Fetch session list for the welcome screen session picker.
     FetchSessionList {
+        /// Surface this fetch was issued for; the result routes back to
+        /// this host's storage only.
+        host: crate::views::session_picker_surface::SessionPickerHost,
+        /// Live generation of the requesting picker at dispatch time.
+        generation: u64,
         /// Text search pushed down to `x.ai/session/list` as `query` (chat
         /// mode: forwarded to the backend conversations search). `None`
         /// fetches the unfiltered list.
@@ -1564,12 +1582,22 @@ pub enum Effect {
         /// When set, stamped as `_meta["x.ai/facetFilters"].kind` so the shell
         /// honors multi-source history under `--chat` instead of forcing chat-only.
         kind_filter: Option<Vec<String>>,
+        /// Server-side `session_kind=headless` policy: `Only` while the picker
+        /// is on the Headless page, `Exclude` everywhere else. Applied by the
+        /// shell before its page truncation, so it cannot be a client refilter.
+        headless_policy: xai_grok_shell::session::unified_list::HeadlessPolicy,
     },
     /// Coalesce picker search keystrokes: fires
     /// [`TaskResult::SessionSearchDebounceExpired`] after a short sleep; the
-    /// expiry acts only if `seq` is still current (Build: FTS5 deep search
-    /// against the deep-search seq; chat: server refetch against the list seq).
-    DebounceSessionSearch { query: String, seq: u64 },
+    /// expiry acts only if `host`, `generation`, and `seq` still name the
+    /// live picker (Build: FTS5 deep search against the deep-search seq;
+    /// chat: server refetch against the list seq).
+    DebounceSessionSearch {
+        host: crate::views::session_picker_surface::SessionPickerHost,
+        generation: u64,
+        query: String,
+        seq: u64,
+    },
     /// Fetch the leader session roster (FleetView dashboard) via
     /// `x.ai/sessions/list`. Only issued in leader mode while the
     /// dashboard is open.
@@ -1579,12 +1607,27 @@ pub enum Effect {
     /// FleetView roster. Issued while the dashboard is open and NOT in leader
     /// mode so the dashboard shows idle sessions instead of being empty.
     FetchDashboardSessions,
+    /// Lazily open dashboard v2's process-owned SQLite store and read its
+    /// initial snapshot off the event-loop thread.
+    LoadWorkspaceSnapshot { db_path: std::path::PathBuf },
+    /// Apply one coalesced dashboard-v2 adoption/metadata batch through the
+    /// process-owned store connection.
+    UpsertWorkspaceMembers {
+        store: xai_grok_dashboard_store::WorkspaceStore,
+        members: Vec<xai_grok_dashboard_store::NewMember>,
+    },
     /// Load card detail for a specific session (lazy, reads chat history from disk).
     LoadCardDetail {
+        /// Surface whose row expansion requested the detail.
+        host: crate::views::session_picker_surface::SessionPickerHost,
+        /// Live generation of the requesting picker at dispatch time.
+        generation: u64,
         source: String,
         session_id: String,
         cwd: String,
-        generation: u64,
+        /// Snapshot of the requesting surface's detail seq; the result is
+        /// dropped when the surface's rows or filters changed meanwhile.
+        seq: u64,
     },
     /// Restore a remote session from GCS then load it. Only Build rows reach
     /// this effect: conversation rows have no GCS archive.
@@ -2169,7 +2212,19 @@ pub enum Effect {
         after: AfterSessionDelete,
     },
     /// Deep-search sessions by content (FTS via ACP).
-    DeepSearchSessions { query: String, seq: u64 },
+    DeepSearchSessions {
+        /// Surface this search was issued for; the result routes back to
+        /// this host's storage only.
+        host: crate::views::session_picker_surface::SessionPickerHost,
+        /// Live generation of the requesting picker at dispatch time.
+        generation: u64,
+        query: String,
+        seq: u64,
+        /// Server-side headless policy of the page that consumes the hits:
+        /// `Only` on the Headless page, `Exclude` everywhere else. Unresolved
+        /// index rows are omitted from both classified views.
+        headless_policy: xai_grok_shell::session::unified_list::HeadlessPolicy,
+    },
     /// Call `x.ai/session/fork` to create a peer session that resumes
     /// from `parent_session_id` in the same cwd (no worktree). Mirror of
     /// the worktree branch of [`Effect::CreateWorktreeSession`]; the
@@ -2259,7 +2314,7 @@ pub enum Effect {
     FetchPromptSuggestion {
         agent_id: AgentId,
         generation: u64,
-        /// Suggestion model resolved by the pager (`grok-build-0.1` when the
+        /// Suggestion model resolved by the pager (`grok-4.6` when the
         /// catalog offers it); `None` = shell falls back to the session model.
         model: Option<String>,
         session_id: Option<String>,
@@ -2373,6 +2428,12 @@ impl TaskResult {
     }
 }
 #[derive(Debug)]
+pub struct WorkspaceMemberUpsertFailure {
+    pub session_id: String,
+    pub error: String,
+    pub retryable: bool,
+}
+#[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum TaskResult {
     /// A `command` status line finished.
@@ -2468,6 +2529,12 @@ pub enum TaskResult {
     },
     /// Session list fetched for the welcome screen picker.
     SessionListLoaded {
+        /// Echo of [`Effect::FetchSessionList::host`]; results apply only to
+        /// the requesting host's picker storage.
+        host: crate::views::session_picker_surface::SessionPickerHost,
+        /// Echo of [`Effect::FetchSessionList::generation`]; results for a
+        /// superseded picker incarnation are dropped.
+        generation: u64,
         sessions: Vec<crate::app::app_view::SessionPickerEntry>,
         /// Degraded conversations lane (`_meta["x.ai/partial"]`), surfaced
         /// as an actionable picker notice instead of a silent empty list.
@@ -2501,6 +2568,10 @@ pub enum TaskResult {
     },
     /// Session list fetch failed.
     SessionListFailed {
+        /// Echo of [`Effect::FetchSessionList::host`].
+        host: crate::views::session_picker_surface::SessionPickerHost,
+        /// Echo of [`Effect::FetchSessionList::generation`].
+        generation: u64,
         error: String,
         /// Echo of [`Effect::FetchSessionList::seq`]; stale failures are dropped.
         seq: u64,
@@ -2511,6 +2582,10 @@ pub enum TaskResult {
     },
     /// Picker search debounce elapsed ([`Effect::DebounceSessionSearch`]).
     SessionSearchDebounceExpired {
+        /// Echo of [`Effect::DebounceSessionSearch::host`].
+        host: crate::views::session_picker_surface::SessionPickerHost,
+        /// Echo of [`Effect::DebounceSessionSearch::generation`].
+        generation: u64,
         query: String,
         seq: u64,
     },
@@ -2529,11 +2604,38 @@ pub enum TaskResult {
     DashboardSessionsLoaded {
         sessions: Vec<crate::app::roster::RosterEntry>,
     },
+    /// Dashboard v2's process-owned store and initial consistent view.
+    WorkspaceSnapshotLoaded {
+        store: xai_grok_dashboard_store::WorkspaceStore,
+        snapshot: xai_grok_dashboard_store::WorkspaceSnapshot,
+    },
+    /// Dashboard v2 store open or initial snapshot failed.
+    WorkspaceSnapshotFailed {
+        error: String,
+    },
+    /// A dashboard-v2 write batch finished and returned the sole store handle.
+    WorkspaceMembersUpserted {
+        store: xai_grok_dashboard_store::WorkspaceStore,
+        snapshot: Result<xai_grok_dashboard_store::WorkspaceSnapshot, String>,
+        failures: Vec<WorkspaceMemberUpsertFailure>,
+        attempted: Vec<xai_grok_dashboard_store::NewMember>,
+    },
+    /// The blocking workspace writer panicked or was cancelled, losing its
+    /// moved handle; reopen the store before any further writes.
+    WorkspaceMembersUpsertTaskFailed {
+        db_path: std::path::PathBuf,
+        error: String,
+    },
     /// Card detail loaded for a session in the picker.
     CardDetailLoaded {
+        /// Echo of [`Effect::LoadCardDetail::host`].
+        host: crate::views::session_picker_surface::SessionPickerHost,
+        /// Echo of [`Effect::LoadCardDetail::generation`].
+        generation: u64,
         source: String,
         session_id: String,
-        generation: u64,
+        /// Echo of [`Effect::LoadCardDetail::seq`].
+        seq: u64,
         detail: crate::app::app_view::CardDetail,
     },
     /// Remote session restored successfully — now load it. Always a Build
@@ -3001,6 +3103,10 @@ pub enum TaskResult {
         generation: u64,
     },
     DeepSearchResults {
+        /// Echo of [`Effect::DeepSearchSessions::host`].
+        host: crate::views::session_picker_surface::SessionPickerHost,
+        /// Echo of [`Effect::DeepSearchSessions::generation`].
+        generation: u64,
         results: Vec<xai_grok_shell::extensions::session_search::SearchSessionHit>,
         seq: u64,
     },

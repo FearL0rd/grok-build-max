@@ -59,7 +59,9 @@ use super::task_result::dispatch_task_result;
 use super::*;
 use crate::acp::model_state::ModelState;
 use crate::acp::tracker::AcpUpdateTracker;
-use crate::app::actions::{Action, Effect, SubagentKillOutcome, SwitchModelError, TaskResult};
+use crate::app::actions::{
+    Action, Effect, SubagentKillOutcome, SwitchModelError, TaskResult, WorkspaceMemberUpsertFailure,
+};
 use crate::app::agent::{AgentId, AgentSession, AgentState};
 use crate::app::agent_view::{ActivePane, AgentView, PromptMode};
 use crate::app::app_view::{
@@ -69,6 +71,7 @@ use crate::app::app_view::{
 use crate::scrollback::block::RenderBlock;
 use crate::scrollback::blocks::{SessionEvent, ToolCallBlock};
 use crate::scrollback::state::ScrollbackState;
+use crate::views::session_picker_surface::SessionPickerHost;
 use agent_client_protocol as acp;
 use indexmap::IndexMap;
 use std::path::PathBuf;
@@ -248,7 +251,10 @@ fn test_app() -> AppView {
         foreign_session_scan_seq: 0,
         foreign_scan_coordinator: Default::default(),
         session_picker_lanes: Default::default(),
-        session_picker_detail_generation: 0,
+        session_picker_detail_seq: 0,
+        picker_generation_counter: 0,
+        session_picker_generation: 0,
+        dashboard_session_picker: None,
         session_picker_entries_query: None,
         session_picker_pending_delete: None,
         welcome_tick: 0,
@@ -285,6 +291,14 @@ fn test_app() -> AppView {
         leader_roster: Vec::new(),
         dashboard_local_sessions: Vec::new(),
         dashboard_sessions_loading: false,
+        workspace_store: None,
+        workspace_snapshot: None,
+        workspace_store_loading: false,
+        workspace_sync_requested: false,
+        workspace_write_in_flight: false,
+        workspace_writes_disabled: false,
+        workspace_retry_metadata: std::collections::HashMap::new(),
+        workspace_failed_metadata: std::collections::HashMap::new(),
         shared_prompt_queues: std::collections::HashMap::new(),
         optimistic_prompt_echoes: std::collections::HashMap::new(),
         pending_running_adoptions: std::collections::HashMap::new(),
@@ -342,6 +356,8 @@ fn make_test_agent_session(app: &AppView, id: AgentId, sid: &str) -> AgentSessio
         available_commands_generation: 0,
         available_tools: None,
         model_switch_pending: false,
+        hook_block_hold: false,
+        blocked_prompt: None,
         user_model_preference: None,
         deferred_model_switch: app.deferred_model_switch_from_cli(),
         bg_tasks: std::collections::BTreeMap::new(),
@@ -527,6 +543,7 @@ fn arm_reconcile_with_meta(
             agent_result: None,
             cancel_trigger: cancel_trigger.map(str::to_string),
             cancellation_category: cancellation_category.map(str::to_string),
+            cancellation_context: None,
             received_at: std::time::Instant::now() - age,
         });
 }
@@ -604,6 +621,8 @@ fn insert_placeholder_agent(app: &mut AppView, id: AgentId) {
             available_commands_generation: 0,
             available_tools: None,
             model_switch_pending: false,
+            hook_block_hold: false,
+            blocked_prompt: None,
             user_model_preference: None,
             deferred_model_switch: None,
             bg_tasks: std::collections::BTreeMap::new(),
@@ -626,6 +645,25 @@ pub(super) fn three_agent_app() -> AppView {
     insert_placeholder_agent(&mut app, AgentId(1));
     insert_placeholder_agent(&mut app, AgentId(2));
     app
+}
+#[test]
+fn local_slash_command_keeps_hook_block_hold() {
+    let mut app = test_app_with_agent();
+    app.agents
+        .get_mut(&AgentId(0))
+        .unwrap()
+        .session
+        .hook_block_hold = true;
+    let _ = dispatch_send_prompt_inner(&mut app, "/help".into(), true, false, false);
+    assert!(
+        app.agents.get(&AgentId(0)).unwrap().session.hook_block_hold,
+        "a local-UI slash command is not re-engagement and must keep the hold"
+    );
+    let _ = dispatch_send_prompt_inner(&mut app, "a real prompt".into(), true, false, false);
+    assert!(
+        !app.agents.get(&AgentId(0)).unwrap().session.hook_block_hold,
+        "a plain prompt submission releases the hold"
+    );
 }
 use crate::slash::commands::fork::ForkArgs;
 fn fork_args(worktree_override: Option<bool>, directive: Option<&str>) -> ForkArgs {
@@ -749,6 +787,8 @@ fn two_agent_app_with_bg_task() -> AppView {
             available_commands_generation: 0,
             available_tools: None,
             model_switch_pending: false,
+            hook_block_hold: false,
+            blocked_prompt: None,
             user_model_preference: None,
             deferred_model_switch: None,
             bg_tasks: std::collections::BTreeMap::new(),
@@ -803,6 +843,7 @@ fn make_picker_entry(id: &str, cwd: &str) -> crate::app::app_view::SessionPicker
         worktree_label: None,
         last_turn_summary: None,
         last_recap: None,
+        session_kind: None,
         card_detail: None,
     }
 }
@@ -812,11 +853,16 @@ fn make_conversation_entry(id: &str) -> crate::app::app_view::SessionPickerEntry
     e
 }
 /// Open a SessionPicker modal on the active agent seeded with `entries`.
+///
+/// Stamps a real allocated generation (production modals get theirs from
+/// `dispatch_fetch_session_list`), so helper-seeded modals can receive
+/// generation-gated results.
 fn open_session_picker_with(
     app: &mut AppView,
     entries: Vec<crate::app::app_view::SessionPickerEntry>,
 ) {
     use crate::views::modal::ActiveModal;
+    let generation = app.alloc_picker_generation();
     let agent = get_active_agent_mut(app).expect("active agent");
     agent.active_modal = Some(ActiveModal::SessionPicker {
         state: crate::views::picker::PickerState::default(),
@@ -828,10 +874,37 @@ fn open_session_picker_with(
         content_results: None,
         content_loading: false,
         deep_search_seq: 0,
+        generation,
+        detail_seq: 0,
         entries_query: None,
         source_filter: crate::views::session_picker::SourceFilter::default(),
         pending_delete: None,
     });
+}
+/// Live generation of the active agent's SessionPicker modal, for stamping
+/// modal-host results the way the executors echo them.
+fn modal_picker_generation(app: &AppView) -> u64 {
+    use crate::views::modal::ActiveModal;
+    match get_active_agent(app)
+        .expect("active agent")
+        .active_modal
+        .as_ref()
+    {
+        Some(ActiveModal::SessionPicker { generation, .. }) => *generation,
+        _ => panic!("expected SessionPicker modal"),
+    }
+}
+/// Live card-detail seq of the active agent's SessionPicker modal.
+fn modal_picker_detail_seq(app: &AppView) -> u64 {
+    use crate::views::modal::ActiveModal;
+    match get_active_agent(app)
+        .expect("active agent")
+        .active_modal
+        .as_ref()
+    {
+        Some(ActiveModal::SessionPicker { detail_seq, .. }) => *detail_seq,
+        _ => panic!("expected SessionPicker modal"),
+    }
 }
 /// Toast strings match the expected format and contain on/off
 /// status.
@@ -950,16 +1023,25 @@ fn dashboard_row_order(app: &AppView) -> Vec<crate::views::dashboard::DashboardR
     } else {
         &app.dashboard_local_sessions
     };
-    let rows = crate::views::dashboard::build_rows_with_roster(
-        &app.agents,
-        &d.pinned,
-        &d.reorder,
-        None,
-        d.grouping,
-        &d.filter,
-        home,
-        roster,
-    );
+    let rows = if app.workspace_dashboard_enabled {
+        app.workspace_snapshot
+            .as_ref()
+            .map(|snapshot| {
+                crate::views::dashboard::build_rows_with_workspace(&app.agents, snapshot, home)
+            })
+            .unwrap_or_default()
+    } else {
+        crate::views::dashboard::build_rows_with_roster(
+            &app.agents,
+            &d.pinned,
+            &d.reorder,
+            None,
+            d.grouping,
+            &d.filter,
+            home,
+            roster,
+        )
+    };
     crate::views::dashboard::render::focusables(
         &rows,
         d.grouping,

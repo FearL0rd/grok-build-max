@@ -557,20 +557,15 @@ pub struct InstrumentationTimer {
     start: Instant,
     fields: Vec<(String, Value)>,
     subphase: Option<crate::startup::Subphase>,
+    subphase_span: Option<tracing::Span>,
+    timer_span: tracing::Span,
     mode: InstrumentationMode,
     _span_guard: Option<tracing::span::EnteredSpan>,
 }
 
 impl InstrumentationTimer {
     pub fn new(name: &'static str) -> Self {
-        Self {
-            name,
-            start: Instant::now(),
-            fields: Vec::new(),
-            subphase: None,
-            mode: mode(),
-            _span_guard: None,
-        }
+        Self::new_with_span(name, mode(), None)
     }
 
     pub fn new_with_span(
@@ -578,11 +573,21 @@ impl InstrumentationTimer {
         mode: InstrumentationMode,
         span_guard: Option<tracing::span::EnteredSpan>,
     ) -> Self {
+        let timer_span = if matches!(
+            mode,
+            InstrumentationMode::Disabled | InstrumentationMode::Chrome
+        ) {
+            tracing::Span::none()
+        } else {
+            tracing::info_span!("timer", name = name)
+        };
         Self {
             name,
             start: Instant::now(),
             fields: Vec::new(),
             subphase: None,
+            subphase_span: None,
+            timer_span,
             mode,
             _span_guard: span_guard,
         }
@@ -602,6 +607,10 @@ impl InstrumentationTimer {
     /// (while startup is active), so producer to field is checked at compile time.
     pub fn with_subphase(&mut self, sp: crate::startup::Subphase) -> &mut Self {
         self.subphase = Some(sp);
+        // Gated like the drop-time field mirror: a span only when recording is.
+        if self.subphase_span.is_none() && crate::startup::is_active() {
+            self.subphase_span = Some(crate::startup::subphase_span(sp, &self.timer_span));
+        }
         self
     }
 }
@@ -609,6 +618,12 @@ impl InstrumentationTimer {
 impl Drop for InstrumentationTimer {
     fn drop(&mut self) {
         let elapsed = self.start.elapsed();
+        // Close at the elapsed stamp, so span duration and `*_ms` agree.
+        drop(self.subphase_span.take());
+        drop(std::mem::replace(
+            &mut self.timer_span,
+            tracing::Span::none(),
+        ));
         // Mirror into `unified.jsonl` while startup is active, so a slow-launch
         // report needs no env vars or repro; the first usable session latches this off.
         if crate::startup::is_active() {

@@ -551,6 +551,8 @@ pub struct RemoteSettings {
     pub folder_trust_enabled: Option<bool>,
     #[serde(default)]
     pub write_file_enabled: Option<bool>,
+    #[serde(default)]
+    pub active_agent_messages_enabled: Option<bool>,
     /// File toolset: `"standard"` or `"hashline"`.
     /// Server-side default; local `[toolset] file_toolset` in config.toml
     /// takes precedence when set.
@@ -740,9 +742,8 @@ pub struct RemoteSettings {
     /// threshold the shell speculatively summarizes the history prefix in the
     /// background (pass 1 → NOTE₁); at compaction it summarizes NOTE₁ + the
     /// recent tail (pass 2 → final summary), keeping summarizer latency off the
-    /// critical path. `Some(true)` enables (remote rollout), `Some(false)` forces
-    /// off, `None` falls back to `[features] two_pass_compaction` /
-    /// `GROK_TWO_PASS_COMPACTION` / default (off).
+    /// critical path. `Some(false)` forces off, `None` falls through env /
+    /// `[features]` / default (on).
     #[serde(default)]
     pub two_pass_compaction_enabled: Option<bool>,
     /// Dynamic tip list from remote settings. When present with non-empty entries,
@@ -786,7 +787,7 @@ pub struct RemoteSettings {
     /// ghost text), from the `grok_build_settings` remote settings flag. Sits below
     /// env (`GROK_PROMPT_SUGGESTIONS_MODEL`) and `[models] prompt_suggestion`
     /// in config.toml, above the client hint and the built-in
-    /// `grok-build-0.1` default. The effective model is catalog-guarded: when
+    /// `grok-4.6` default. The effective model is catalog-guarded: when
     /// it is not in the shell's model catalog the suggestion request is
     /// skipped entirely (never the session model). See
     /// `ModelOverrideConfig::resolve` and `handle_suggest_prompt`.
@@ -1255,6 +1256,9 @@ pub struct GoalRoleModel {
     pub agent_type: String,
 }
 #[cfg(test)]
+#[path = "remote_settings_tests.rs"]
+mod remote_settings_tests;
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]
@@ -1377,18 +1381,18 @@ mod tests {
     }
     #[test]
     fn remote_settings_image_description_model_round_trip() {
-        let json = r#"{"image_description_model": "grok-build"}"#;
+        let json = r#"{"image_description_model": "grok-4.6"}"#;
         let s: RemoteSettings = serde_json::from_str(json).unwrap();
-        assert_eq!(s.image_description_model.as_deref(), Some("grok-build"));
+        assert_eq!(s.image_description_model.as_deref(), Some("grok-4.6"));
         let out = serde_json::to_string(&s).unwrap();
         let s2: RemoteSettings = serde_json::from_str(&out).unwrap();
         assert_eq!(s2.image_description_model, s.image_description_model);
     }
     #[test]
     fn remote_settings_prompt_suggestion_model_round_trip() {
-        let json = r#"{"prompt_suggestion_model": "grok-build-0.1"}"#;
+        let json = r#"{"prompt_suggestion_model": "grok-4.6"}"#;
         let s: RemoteSettings = serde_json::from_str(json).unwrap();
-        assert_eq!(s.prompt_suggestion_model.as_deref(), Some("grok-build-0.1"));
+        assert_eq!(s.prompt_suggestion_model.as_deref(), Some("grok-4.6"));
         let out = serde_json::to_string(&s).unwrap();
         let s2: RemoteSettings = serde_json::from_str(&out).unwrap();
         assert_eq!(s2.prompt_suggestion_model, s.prompt_suggestion_model);

@@ -295,12 +295,14 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
                 return vec![];
             }
             use crate::views::modal::ActiveModal;
-            let detail_generation = app.session_picker_detail_generation;
+            use crate::views::session_picker_surface::SessionPickerHost;
             let from_modal = if let Some(agent) = get_active_agent_mut(app) {
                 if let Some(ActiveModal::SessionPicker {
                     entries: Some(ref entries),
                     ref mut state,
                     ref content_results,
+                    generation,
+                    detail_seq,
                     ..
                 }) = agent.active_modal
                 {
@@ -316,10 +318,12 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
                         let entry = &entries[idx];
                         if native_source && entry.card_detail.is_none() {
                             return vec![Effect::LoadCardDetail {
+                                host: SessionPickerHost::AgentModal,
+                                generation,
                                 source: entry.source.clone(),
                                 session_id: entry.id.clone(),
                                 cwd: entry.cwd.clone(),
-                                generation: detail_generation,
+                                seq: detail_seq,
                             }];
                         }
                         return vec![];
@@ -364,10 +368,12 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
                     && entry.card_detail.is_none()
                 {
                     return vec![Effect::LoadCardDetail {
+                        host: SessionPickerHost::Welcome,
+                        generation: app.session_picker_generation,
                         source: entry.source.clone(),
                         session_id: entry.id.clone(),
                         cwd: entry.cwd.clone(),
-                        generation: detail_generation,
+                        seq: app.session_picker_detail_seq,
                     }];
                 }
             } else if native_source
@@ -402,6 +408,28 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::ShowWordSelectTip => dispatch_show_word_select_tip(app),
         Action::AcceptWordSelectTip => dispatch_accept_word_select_tip(app),
         Action::DrainQueue => dispatch_drain_queue(app),
+        Action::PromptBlockAnswered { row_id, choice } => {
+            use crate::app::actions::PromptBlockChoice;
+            with_active_agent(app, |agent| match choice {
+                PromptBlockChoice::Edit => {
+                    agent.enter_queue_edit(row_id, false, None);
+                }
+                PromptBlockChoice::Resend => {
+                    agent.release_hook_block_hold();
+                }
+                PromptBlockChoice::Discard => {
+                    if let Some(removed) = agent.remove_local_queue_row(row_id) {
+                        for image in &removed.images {
+                            crate::prompt_images::cleanup_temp_file(image);
+                        }
+                    }
+                }
+            });
+            match choice {
+                PromptBlockChoice::Edit => vec![],
+                PromptBlockChoice::Resend | PromptBlockChoice::Discard => dispatch_drain_queue(app),
+            }
+        }
         Action::QueueRemoveShared {
             id,
             expected_version,

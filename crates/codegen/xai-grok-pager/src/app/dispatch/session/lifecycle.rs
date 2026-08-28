@@ -323,7 +323,7 @@ fn apply_welcome_workspace_on_new_session(app: &mut AppView) -> Result<(), Vec<E
             app.welcome_local_workspace_ack_pending = true;
             app.session_picker_entries = None;
             app.session_picker_loading = false;
-            app.session_picker_list_seq = app.session_picker_list_seq.saturating_add(1);
+            super::foreign::next_picker_list_generation(app);
             Err(vec![])
         }
         Err(err) => {
@@ -394,6 +394,8 @@ pub(in crate::app::dispatch) fn dispatch_new_session_inner_with_id(
             available_commands_generation: 1,
             available_tools: None,
             model_switch_pending: false,
+            hook_block_hold: false,
+            blocked_prompt: None,
             user_model_preference: None,
             deferred_model_switch: app.deferred_model_switch_from_cli(),
             bg_tasks: std::collections::BTreeMap::new(),
@@ -946,6 +948,8 @@ pub(in crate::app::dispatch) fn dispatch_new_worktree_session(
             available_commands_generation: 1,
             available_tools: None,
             model_switch_pending: false,
+            hook_block_hold: false,
+            blocked_prompt: None,
             user_model_preference: None,
             deferred_model_switch: app.deferred_model_switch_from_cli(),
             bg_tasks: std::collections::BTreeMap::new(),

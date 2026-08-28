@@ -2790,6 +2790,8 @@ fn dashboard_stop_with_peek_open_moves_selection_and_peek_down_one() {
             &[],
             false,
             None,
+            false,
+            None,
         );
     };
     render(&mut app);
@@ -3274,6 +3276,7 @@ mod welcome_workspace_mode {
             worktree_label: None,
             last_turn_summary: None,
             last_recap: None,
+            session_kind: None,
             card_detail: None,
         }]);
         let effects = dispatch(Action::PickSession(0), &mut app);
@@ -3321,6 +3324,7 @@ mod welcome_workspace_mode {
             worktree_label: None,
             last_turn_summary: None,
             last_recap: None,
+            session_kind: None,
             card_detail: None,
         }]);
         let effects = dispatch(Action::PickSession(0), &mut app);
@@ -3382,6 +3386,7 @@ mod welcome_workspace_mode {
             worktree_label: None,
             last_turn_summary: None,
             last_recap: None,
+            session_kind: None,
             card_detail: None,
         }]);
         let _ = dispatch(Action::PickSessionInWorktree(0), &mut app);
@@ -3421,6 +3426,7 @@ mod welcome_workspace_mode {
             worktree_label: None,
             last_turn_summary: None,
             last_recap: None,
+            session_kind: None,
             card_detail: None,
         }]);
         let effects = dispatch(Action::PickSessionInWorktree(0), &mut app);
@@ -3467,6 +3473,7 @@ mod welcome_workspace_mode {
             worktree_label: None,
             last_turn_summary: None,
             last_recap: None,
+            session_kind: None,
             card_detail: None,
         }]);
         let effects = dispatch(Action::PickSessionInWorktree(0), &mut app);
@@ -3512,6 +3519,7 @@ mod welcome_workspace_mode {
             worktree_label: None,
             last_turn_summary: None,
             last_recap: None,
+            session_kind: None,
             card_detail: None,
         }]);
         let effects = dispatch(Action::PickSession(0), &mut app);
@@ -3560,6 +3568,7 @@ mod welcome_workspace_mode {
             worktree_label: None,
             last_turn_summary: None,
             last_recap: None,
+            session_kind: None,
             card_detail: None,
         }]);
         let effects = dispatch(Action::PickSession(0), &mut app);
@@ -3635,6 +3644,7 @@ mod welcome_workspace_mode {
             worktree_label: None,
             last_turn_summary: None,
             last_recap: None,
+            session_kind: None,
             card_detail: None,
         }]);
         let effects = dispatch(Action::PickSession(0), &mut app);
@@ -3710,6 +3720,7 @@ mod welcome_workspace_mode {
             worktree_label: None,
             last_turn_summary: None,
             last_recap: None,
+            session_kind: None,
             card_detail: None,
         }]);
         let effects = dispatch(Action::PickSession(0), &mut app);
@@ -3737,9 +3748,12 @@ mod welcome_workspace_mode {
         assert!(!welcome_history_build_bypass_applies(&[], true));
         assert!(!welcome_history_build_bypass_applies(
             &[Effect::FetchSessionList {
+                host: crate::views::session_picker_surface::SessionPickerHost::Welcome,
+                generation: 0,
                 query: None,
                 seq: 0,
                 kind_filter: None,
+                headless_policy: Default::default(),
             }],
             true
         ));

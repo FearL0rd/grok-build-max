@@ -103,6 +103,7 @@ async fn create_test_actor_with_memory(
         notifications_suppressed: false,
         rewindable: false,
         front_message_committed: false,
+        hook_block_hold: Default::default(),
         nudges_used_this_session: 0,
     });
     let (chat_event_tx, _chat_event_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -287,7 +288,7 @@ async fn create_test_actor_with_memory(
         managed_mcp_handle: Default::default(),
         initial_client_mcp_servers: vec![],
         tool_metadata_snapshot: Arc::new(std::sync::Mutex::new(Default::default())),
-        mcp_announced_servers: Mutex::new(HashMap::new()),
+        mcp_announcements: Default::default(),
         mcp_reminder_mode: McpReminderMode::Delta,
         mcp_reminder_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         mcp_connecting_reminder_injected: std::cell::Cell::new(false),

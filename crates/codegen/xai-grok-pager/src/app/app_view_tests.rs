@@ -258,7 +258,10 @@ pub(crate) fn test_app() -> AppView {
         foreign_session_scan_seq: 0,
         foreign_scan_coordinator: Default::default(),
         session_picker_lanes: Default::default(),
-        session_picker_detail_generation: 0,
+        session_picker_detail_seq: 0,
+        picker_generation_counter: 0,
+        session_picker_generation: 0,
+        dashboard_session_picker: None,
         session_picker_entries_query: None,
         session_picker_pending_delete: None,
         welcome_tick: 0,
@@ -296,6 +299,14 @@ pub(crate) fn test_app() -> AppView {
         leader_roster: Vec::new(),
         dashboard_local_sessions: Vec::new(),
         dashboard_sessions_loading: false,
+        workspace_store: None,
+        workspace_snapshot: None,
+        workspace_store_loading: false,
+        workspace_sync_requested: false,
+        workspace_write_in_flight: false,
+        workspace_writes_disabled: false,
+        workspace_retry_metadata: std::collections::HashMap::new(),
+        workspace_failed_metadata: std::collections::HashMap::new(),
         shared_prompt_queues: std::collections::HashMap::new(),
         optimistic_prompt_echoes: std::collections::HashMap::new(),
         pending_running_adoptions: std::collections::HashMap::new(),
@@ -349,6 +360,8 @@ pub(crate) fn test_app_with_agent() -> AppView {
             available_commands_generation: 0,
             available_tools: None,
             model_switch_pending: false,
+            hook_block_hold: false,
+            blocked_prompt: None,
             user_model_preference: None,
             deferred_model_switch: None,
             bg_tasks: std::collections::BTreeMap::new(),
@@ -542,6 +555,8 @@ fn idle_child_view(app: &AppView, id_n: usize, sid: &str) -> Box<AgentView> {
         available_commands_generation: 0,
         available_tools: None,
         model_switch_pending: false,
+        hook_block_hold: false,
+        blocked_prompt: None,
         user_model_preference: None,
         deferred_model_switch: None,
         bg_tasks: std::collections::BTreeMap::new(),
@@ -753,6 +768,8 @@ fn tick_demand_fast_while_modal_session_picker_loads() {
             content_results: None,
             content_loading: false,
             deep_search_seq: 0,
+            generation: 0,
+            detail_seq: 0,
             entries_query: None,
             source_filter: crate::views::session_picker::SourceFilter::default(),
             pending_delete: None,
@@ -778,6 +795,7 @@ fn tick_demand_fast_while_modal_session_picker_loads() {
         worktree_label: None,
         last_turn_summary: None,
         last_recap: None,
+        session_kind: None,
         card_detail: None,
     };
     if let Some(crate::views::modal::ActiveModal::SessionPicker { entries, .. }) =
@@ -1302,6 +1320,7 @@ fn needs_animation_gates_pending_turn_end_reconcile() {
             agent_result: None,
             cancel_trigger: None,
             cancellation_category: None,
+            cancellation_context: None,
             received_at: std::time::Instant::now()
                 - (TURN_END_RECONCILE_GRACE + std::time::Duration::from_secs(1)),
         });
@@ -2114,6 +2133,7 @@ fn welcome_session_entry(id: &str) -> SessionPickerEntry {
         worktree_label: None,
         last_turn_summary: None,
         last_recap: None,
+        session_kind: None,
         card_detail: None,
     }
 }
@@ -3071,6 +3091,23 @@ fn esc_cancels_running_wake_turn_while_pane_is_idle() {
         app.agents[&id].cancel_trigger_hint,
         Some(crate::app::actions::CancelTrigger::Esc)
     );
+}
+#[test]
+fn streaming_wake_turn_counts_as_running_for_minimal_commit() {
+    let mut app = test_app_with_agent();
+    let id = super::super::agent::AgentId(0);
+    let agent = app.agents.get_mut(&id).unwrap();
+    assert!(agent.session.state.is_idle());
+    assert!(!crate::minimal_api::is_turn_or_wake_running(agent));
+    agent.note_streaming_wake_turn("subagent-completed-abc");
+    assert!(
+        crate::minimal_api::is_turn_or_wake_running(agent),
+        "a streaming wake turn must hold the minimal commit frontier"
+    );
+    agent.running_wake_turn = None;
+    assert!(!crate::minimal_api::is_turn_or_wake_running(agent));
+    agent.session.state = AgentState::TurnRunning;
+    assert!(crate::minimal_api::is_turn_or_wake_running(agent));
 }
 #[test]
 fn esc_from_prompt_pane_running_turn_with_draft_cancels_preserving_draft() {
@@ -4647,7 +4684,7 @@ fn dashboard_stale_clears_skip_attached_popup_agent() {
     for _ in 0..2 {
         assert!(AppView::dashboard_stale_image_clears(&mut app.agents, Some(id)).is_none());
         let popup = crate::terminal::overlay::static_image(&png, 20, 10, 0, 0, 7).unwrap();
-        assert!(!popup.as_str().contains("a=t"));
+        assert!(popup.as_str().is_empty());
         let _ = popup.commit();
     }
     let agent = app.agents.get(&id).unwrap();
@@ -4683,14 +4720,14 @@ fn dashboard_too_small_popup_clears_shared_overlay_slot() {
         !crate::terminal::overlay::static_image(&png, 20, 10, 0, 0, 8)
             .unwrap()
             .as_str()
-            .contains("a=t")
+            .contains("a=T")
     );
     clear.write_to(&mut Vec::new()).unwrap();
     assert!(
         crate::terminal::overlay::static_image(&png, 20, 10, 0, 0, 8)
             .unwrap()
             .as_str()
-            .contains("a=t")
+            .contains("a=T")
     );
 }
 #[test]
@@ -6624,6 +6661,7 @@ fn welcome_picker_f_cycle_disabled_under_chat_mode() {
         worktree_label: None,
         last_turn_summary: None,
         last_recap: None,
+        session_kind: None,
         card_detail: None,
     };
     let f_key = Event::Key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));

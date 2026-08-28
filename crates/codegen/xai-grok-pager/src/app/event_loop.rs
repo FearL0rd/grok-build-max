@@ -1047,6 +1047,7 @@ pub(crate) async fn run(
     terminal: &mut PagerTerminal,
     connection: crate::acp::AcpConnection,
     pending_startup: xai_grok_telemetry::startup::PendingStartup,
+    tracing_handle: crate::tracing::TracingHandle,
     config_watcher: &mut ConfigWatcher,
     args: &PagerArgs,
     session_cwd: Option<std::path::PathBuf>,
@@ -1058,16 +1059,6 @@ pub(crate) async fn run(
     >,
     mut writer_event_rx: tokio::sync::mpsc::UnboundedReceiver<crate::render::draw::WriterEvent>,
 ) -> anyhow::Result<RunResult> {
-    // Initialize tracing capture. The channel `rx` will be wired to a
-    // TracingModel (and ultimately a tracing pane) once integrated.
-    // For now we drain-and-discard in `AppView::tick()` to avoid unbounded
-    // memory growth.
-    if args.log_sampling {
-        // SAFETY: called before any threads are spawned by init_tracing.
-        unsafe { std::env::set_var("GROK_LOG_SAMPLING", "1") };
-    }
-    let tracing_handle = crate::tracing::init_tracing();
-
     crate::unified_log::init(connection.tx.clone());
     crate::unified_log::info("pager started", None, None);
     xai_grok_telemetry::startup::enter(xai_grok_telemetry::startup::StartupPhase::AppInit);
@@ -1112,13 +1103,13 @@ pub(crate) async fn run(
         remote_permission_mode,
     );
     app.default_yolo = launch_yolo.yolo;
-    // Gated launch-auto (CLI `--permission-mode auto`, config, or the
-    // interactive soft default when nothing selects a mode). Hoisted so it can
-    // be re-applied after `load_initial_ui_config()` replaces `current_ui` below.
-    let launch_auto = xai_grok_shell::util::config::effective_auto_for_launch_interactive(
+    // Hoisted so it can be re-applied after `load_initial_ui_config()` replaces
+    // `current_ui` below.
+    let launch_auto = xai_grok_shell::util::config::effective_auto_for_launch(
         args.yolo,
         args.permission_mode_flag.as_deref(),
         remote_permission_mode,
+        xai_grok_shell::util::config::default_interactive_permission_mode(),
     );
     if launch_auto {
         app.current_ui.permission_mode = Some("auto".into());
@@ -2241,6 +2232,12 @@ pub(crate) async fn run(
     // land in the same batch.
     let mut csi_filter = super::csi_filter::CsiFragmentFilter::new();
 
+    // Persistent X10 reassembly filter — recombines mouse reports whose
+    // column byte a UTF-8-converting relay expanded (ConPTY/WSL), which
+    // crossterm mis-parses into a magic-shape mouse event plus a stray
+    // typed character.
+    let mut x10_filter = super::x10_filter::X10ReassemblyFilter::new();
+
     // Swallows the fire-and-forget XTVERSION reply whenever it arrives;
     // armed only when the startup query is still unanswered.
     let mut xt_filter = super::xt_filter::XtversionFilter::new();
@@ -2297,6 +2294,11 @@ pub(crate) async fn run(
             );
         }
         if quit_after_deferred_load {
+            break;
+        }
+
+        let workspace_effects = super::workspace_sync::drain(&mut app);
+        if process_effects(workspace_effects, &mut tasks, &mut app, &progress_tx) {
             break;
         }
 
@@ -2414,7 +2416,10 @@ pub(crate) async fn run(
         // closed→open transition rather than every iteration. Applies in both
         // modes: leader mode polls the live roster, non-leader mode polls the
         // local on-disk idle-session list.
-        if roster_poll_at.is_none() && matches!(app.active_view, ActiveView::AgentDashboard) {
+        if !app.workspace_dashboard_enabled
+            && roster_poll_at.is_none()
+            && matches!(app.active_view, ActiveView::AgentDashboard)
+        {
             roster_poll_at = Some(Instant::now());
         }
 
@@ -2632,6 +2637,7 @@ pub(crate) async fn run(
                         }
                     }
                 }
+                super::workspace_sync::request(&mut app);
 
                 // A snapshot inside the refresh floor changes nothing yet but
                 // still owes a run, and the arm below arms the tick only on a
@@ -2750,7 +2756,7 @@ pub(crate) async fn run(
                 let stall_activity = super::event_loop_stall::StallActivity::read();
                 let result = drain_and_process(
                     ev, &mut input_rx, &mut app, &mut tasks, &progress_tx,
-                    &mut csi_filter, &mut xt_filter,
+                    &mut csi_filter, &mut x10_filter, &mut xt_filter,
                 ).await;
                 if let Some(window) =
                     stall_rollup.observe(waited, stall_activity, result.handled, handled_at)
@@ -2919,7 +2925,7 @@ pub(crate) async fn run(
                 // roster; outside leader mode we poll the local on-disk
                 // idle-session list so the dashboard still shows idle sessions.
                 let dashboard_open = matches!(app.active_view, ActiveView::AgentDashboard);
-                if dashboard_open {
+                if dashboard_open && !app.workspace_dashboard_enabled {
                     let eff = if leader_status_rx.is_some() {
                         Effect::FetchRoster
                     } else {
@@ -3677,9 +3683,11 @@ fn normalize_input_event(timed: TimedInputEvent) -> RoutedInputEvent {
 /// of sequential draws, freezing the UI for seconds or minutes.
 ///
 /// Runs [`coalesce_rapid_keys`] and the persistent
-/// [`CsiFragmentFilter`](super::csi_filter::CsiFragmentFilter) before
+/// [`CsiFragmentFilter`](super::csi_filter::CsiFragmentFilter) and
+/// [`X10ReassemblyFilter`](super::x10_filter::X10ReassemblyFilter) before
 /// processing to fix paste on terminals without bracketed paste (e.g.
-/// Windows PowerShell) and filter leaked CSI fragments (SGR mouse and focus reports).
+/// Windows PowerShell), filter leaked CSI fragments (SGR mouse and focus
+/// reports), and recombine relay-mangled X10 mouse reports.
 async fn drain_and_process(
     first: TimedInputEvent,
     input_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TimedInputEvent>,
@@ -3687,6 +3695,7 @@ async fn drain_and_process(
     tasks: &mut JoinSet<TaskResult>,
     progress_tx: &tokio::sync::mpsc::UnboundedSender<effects::RestoreProgressMsg>,
     csi_filter: &mut super::csi_filter::CsiFragmentFilter,
+    x10_filter: &mut super::x10_filter::X10ReassemblyFilter,
     xt_filter: &mut super::xt_filter::XtversionFilter,
 ) -> DrainResult {
     let mut needs_draw = false;
@@ -3727,6 +3736,7 @@ async fn drain_and_process(
         coalesce_rapid_keys(raw_events)
     };
     let coalesced = csi_filter.filter(coalesced);
+    let coalesced = x10_filter.filter(coalesced);
     let coalesced = coalesced
         .into_iter()
         .map(normalize_input_event)
@@ -3739,6 +3749,17 @@ async fn drain_and_process(
         let ev = &routed.event;
         match ev {
             Event::FocusGained => {
+                // Re-assert mouse capture on refocus: ConPTY-backed relays
+                // (VS Code on Windows hosting a WSL/SSH session) can strip DEC
+                // private modes, silently downgrading mouse reports from SGR
+                // to legacy X10 — whose >= 95-column coordinate bytes then
+                // corrupt into typed characters. Idempotent everywhere else,
+                // and gated so a deliberate capture-off state is never undone.
+                if crate::app::MOUSE_CAPTURE_ENABLED.load(std::sync::atomic::Ordering::Acquire) {
+                    xai_grok_shell::util::with_locked_stderr(|stderr| {
+                        let _ = crossterm::execute!(stderr, crossterm::event::EnableMouseCapture);
+                    });
+                }
                 // Force a full repaint on refocus to heal out-of-band stranded rows.
                 // Sets needs_draw (not had_non_resize_change); the draw site honors force_repaint
                 // ahead of the resize debounce, clearing even a coalesced same-size resize.
@@ -4070,6 +4091,18 @@ fn is_pasteable_key_event(ev: &Event) -> bool {
     }
 }
 
+/// A pasted line feed (`\n`, 0x0A). In raw mode crossterm parses a bare LF as
+/// `Ctrl+J` (0x0A is the control code for `j`), while a real Enter keypress is
+/// a carriage return (`\r`) parsed as [`KeyCode::Enter`]. So an `Enter`
+/// immediately followed by this is a pasted CRLF line break, not a submit —
+/// see [`coalesce_rapid_keys`].
+fn is_paste_lf(ev: &Event) -> bool {
+    matches!(ev, Event::Key(ke)
+        if ke.kind == KeyEventKind::Press
+            && ke.code == KeyCode::Char('j')
+            && ke.modifiers == KeyModifiers::CONTROL)
+}
+
 /// Map a voice-chord key event to its action (pure, so it's unit-testable).
 ///
 /// Hold mode is press-to-record / release-to-stop, but only a hold-*owned*
@@ -4136,9 +4169,13 @@ fn is_voice_chord(ke: &KeyEvent) -> bool {
 /// A contiguous run of character/Enter/Tab events is replaced with a
 /// single `Event::Paste` when EITHER:
 ///
-/// 1. `>= PASTE_COALESCE_THRESHOLD` events AND at least one Enter is
-///    followed by more characters (distinguishes `type + submit` from
-///    `pasted multiline`).
+/// 1. `>= PASTE_COALESCE_THRESHOLD` events AND an Enter is followed by more
+///    characters (unambiguous multi-line paste), OR the run contains a
+///    carriage-return/line-feed pair (an `Enter` immediately followed by
+///    [`is_paste_lf`]). A pasted Windows line break arrives as CRLF —
+///    `Enter` (`\r`) then `Ctrl+J` (`\n`) — whereas a real Enter keypress is
+///    a lone `\r`, so this coalesces the paste (e.g. `"foo\r\n"`) without
+///    swallowing a genuine submit.
 /// 2. **Windows only:** `>= PATH_COALESCE_THRESHOLD` events AND the
 ///    assembled text starts with a drag-drop-style path anchor. Some
 ///    Windows Terminal versions deliver dropped paths as keystrokes
@@ -4187,34 +4224,53 @@ fn coalesce_rapid_keys(events: Vec<TimedInputEvent>) -> Vec<TimedInputEvent> {
             let mut text = String::new();
             let mut seen_enter = false;
             let mut has_char_after_enter = false;
+            // An Enter (`\r`) immediately followed by a pasted LF (`\n`): the
+            // CRLF signature of a pasted Windows line break, never a submit.
+            let mut has_crlf = false;
+            let mut prev_was_enter = false;
 
-            while i < events.len() && is_pasteable_key_event(&events[i].event) {
-                if let Event::Key(ke) = &events[i].event {
-                    match ke.code {
-                        KeyCode::Char(c) => {
-                            text.push(c);
-                            if seen_enter {
-                                has_char_after_enter = true;
+            while i < events.len() {
+                if is_pasteable_key_event(&events[i].event) {
+                    if let Event::Key(ke) = &events[i].event {
+                        match ke.code {
+                            KeyCode::Char(c) => {
+                                text.push(c);
+                                if seen_enter {
+                                    has_char_after_enter = true;
+                                }
+                                prev_was_enter = false;
                             }
-                        }
-                        KeyCode::Enter => {
-                            text.push('\n');
-                            seen_enter = true;
-                        }
-                        KeyCode::Tab => {
-                            text.push('\t');
-                            if seen_enter {
-                                has_char_after_enter = true;
+                            KeyCode::Enter => {
+                                text.push('\n');
+                                seen_enter = true;
+                                prev_was_enter = true;
                             }
+                            KeyCode::Tab => {
+                                text.push('\t');
+                                if seen_enter {
+                                    has_char_after_enter = true;
+                                }
+                                prev_was_enter = false;
+                            }
+                            _ => unreachable!("is_pasteable_key_event guards this"),
                         }
-                        _ => unreachable!("is_pasteable_key_event guards this"),
                     }
+                    i += 1;
+                } else if prev_was_enter && is_paste_lf(&events[i].event) {
+                    // LF half of a pasted CRLF: the preceding Enter already
+                    // pushed '\n', so absorb this without a second newline and
+                    // without letting it reach its Ctrl+J binding.
+                    has_crlf = true;
+                    prev_was_enter = false;
+                    i += 1;
+                } else {
+                    break;
                 }
-                i += 1;
             }
 
             let run_len = i - run_start;
-            let multiline_paste = run_len >= PASTE_COALESCE_THRESHOLD && has_char_after_enter;
+            let multiline_paste =
+                (run_len >= PASTE_COALESCE_THRESHOLD && has_char_after_enter) || has_crlf;
             // Windows fallback for drag-drops that arrive as a key
             // burst instead of a bracketed paste — reuse the drop
             // classifier's anchor detector so the two layers can't
@@ -4846,6 +4902,7 @@ mod tests {
         let (progress_tx, _progress_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut tasks = JoinSet::new();
         let mut csi_filter = super::super::csi_filter::CsiFragmentFilter::new();
+        let mut x10_filter = super::super::x10_filter::X10ReassemblyFilter::new();
         let mut xt_filter = super::super::xt_filter::XtversionFilter::new();
 
         let result = drain_and_process(
@@ -4855,6 +4912,7 @@ mod tests {
             &mut tasks,
             &progress_tx,
             &mut csi_filter,
+            &mut x10_filter,
             &mut xt_filter,
         )
         .await;
@@ -4888,6 +4946,7 @@ mod tests {
         let (progress_tx, _progress_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut tasks = JoinSet::new();
         let mut csi_filter = super::super::csi_filter::CsiFragmentFilter::new();
+        let mut x10_filter = super::super::x10_filter::X10ReassemblyFilter::new();
         let mut xt_filter = super::super::xt_filter::XtversionFilter::new();
 
         let result = drain_and_process(
@@ -4897,6 +4956,7 @@ mod tests {
             &mut tasks,
             &progress_tx,
             &mut csi_filter,
+            &mut x10_filter,
             &mut xt_filter,
         )
         .await;
@@ -5918,7 +5978,8 @@ mod tests {
 
     #[test]
     fn coalesce_type_then_submit_not_coalesced() {
-        // Enter is the LAST event — "type + submit", not paste.
+        // Enter is the LAST event with no trailing LF — a real submit
+        // (lone `\r`), not a paste. Must pass through so Enter sends.
         let events = vec![
             press(KeyCode::Char('a')),
             press(KeyCode::Char('b')),
@@ -5928,6 +5989,55 @@ mod tests {
         let result = coalesce_rapid_keys(events);
         assert_eq!(result.len(), 4);
         assert!(matches!(&result[3].event, Event::Key(ke) if ke.code == KeyCode::Enter));
+    }
+
+    #[test]
+    fn coalesce_crlf_paste_ending_in_newline_is_paste() {
+        // Windows paste of "foo\r\n": Enter (`\r`) then Ctrl+J (`\n`). The
+        // CRLF pair marks a paste, so the trailing Enter inserts as text
+        // instead of submitting.
+        let events = vec![
+            press(KeyCode::Char('f')),
+            press(KeyCode::Char('o')),
+            press(KeyCode::Char('o')),
+            press(KeyCode::Enter),
+            press_ctrl(KeyCode::Char('j')),
+        ];
+        let result = coalesce_rapid_keys(events);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].event, Event::Paste("foo\n".to_string()));
+    }
+
+    #[test]
+    fn coalesce_crlf_multiline_collapses_pairs() {
+        // "a\r\nb\r\n" → each Enter+Ctrl+J is one newline; no doubled blanks.
+        let events = vec![
+            press(KeyCode::Char('a')),
+            press(KeyCode::Enter),
+            press_ctrl(KeyCode::Char('j')),
+            press(KeyCode::Char('b')),
+            press(KeyCode::Enter),
+            press_ctrl(KeyCode::Char('j')),
+        ];
+        let result = coalesce_rapid_keys(events);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].event, Event::Paste("a\nb\n".to_string()));
+    }
+
+    #[test]
+    fn coalesce_lone_ctrl_j_not_after_enter_preserved() {
+        // A deliberate Ctrl+J (file-search "down") is not part of a CRLF and
+        // must reach its binding: not absorbed, run does not coalesce.
+        let events = vec![
+            press(KeyCode::Char('a')),
+            press(KeyCode::Char('b')),
+            press_ctrl(KeyCode::Char('j')),
+        ];
+        let result = coalesce_rapid_keys(events);
+        assert_eq!(result.len(), 3);
+        assert!(matches!(&result[2].event,
+            Event::Key(ke) if ke.code == KeyCode::Char('j')
+                && ke.modifiers == KeyModifiers::CONTROL));
     }
 
     #[test]
@@ -6212,8 +6322,8 @@ mod tests {
 
     #[test]
     fn coalesce_mouse_breaks_key_run_preserves_events() {
-        // A genuine paste batch that also collected mouse events.
-        // The paste chars should still coalesce; mouse events are preserved.
+        // A mouse event splits a key run. [a, b, Enter] has a trailing Enter
+        // with no LF → a submit, not coalesced; then [mouse], then [c].
         use crossterm::event::{MouseEvent, MouseEventKind};
         let events = vec![
             press(KeyCode::Char('a')),
@@ -6228,9 +6338,6 @@ mod tests {
             press(KeyCode::Char('c')),
         ];
         let result = coalesce_rapid_keys(events);
-        // The mouse event breaks the key run: [a, b, Enter] (3 keys, but
-        // Enter is last in that sub-run → no char after Enter → not coalesced),
-        // then [mouse], then [c] (1 key).
         assert_eq!(result.len(), 5);
     }
 

@@ -390,6 +390,9 @@ pub struct SessionPickerEntry {
     /// Latest session recap (`lastRecap` on the session/list wire), shown on the
     /// expanded resume card whenever available. Distinct from `last_turn_summary`.
     pub last_recap: Option<String>,
+    /// `sessionKind` from the session/list wire (`"headless"`, `"fork"`,
+    /// `"worktree"`, …). Drives the picker's Headless page filter.
+    pub session_kind: Option<String>,
     /// Lazy-loaded detail for the expanded card view.
     pub card_detail: Option<CardDetail>,
 }
@@ -768,6 +771,30 @@ pub struct AppView {
     pub dashboard_local_sessions: Vec<crate::app::roster::RosterEntry>,
     /// Whether the dashboard is currently loading local sessions (non-leader mode).
     pub dashboard_sessions_loading: bool,
+    /// The single SQLite workspace connection owned by this pager process.
+    /// Opened lazily only after dashboard v2 is entered.
+    pub workspace_store: Option<xai_grok_dashboard_store::WorkspaceStore>,
+    /// Initial workspace view read from [`Self::workspace_store`].
+    pub workspace_snapshot: Option<xai_grok_dashboard_store::WorkspaceSnapshot>,
+    /// Prevents duplicate open/snapshot effects while the first read is pending.
+    pub workspace_store_loading: bool,
+    /// Agent metadata changed after workspace initialization and needs a scan.
+    pub workspace_sync_requested: bool,
+    /// The single store handle is currently owned by an async write effect.
+    pub workspace_write_in_flight: bool,
+    /// A newer read-only schema was opened; suppress writes but keep reads.
+    pub workspace_writes_disabled: bool,
+    /// Exact metadata payloads that have consumed their one automatic retry.
+    pub workspace_retry_metadata: std::collections::HashMap<
+        xai_grok_dashboard_store::SessionId,
+        xai_grok_dashboard_store::MemberMetadata,
+    >,
+    /// Last metadata payloads that exhausted or cannot use their retry. An
+    /// identical payload stays suppressed until its agent metadata changes.
+    pub workspace_failed_metadata: std::collections::HashMap<
+        xai_grok_dashboard_store::SessionId,
+        xai_grok_dashboard_store::MemberMetadata,
+    >,
     /// Server-authoritative shared prompt queues, keyed by `sessionId`
     /// Reconciled from `x.ai/queue/changed` broadcasts so
     /// every client renders the same ordered queue (including prompts queued
@@ -955,10 +982,10 @@ pub struct AppView {
     pub session_picker_deep_search_seq: u64,
     /// Monotonically increasing sequence number for session list fetches
     /// (`Effect::FetchSessionList`): only the seq-current response is
-    /// applied, so a stale completion can't clobber newer results. Bumped
-    /// only under chat mode (server-search supersede); in Build mode it
-    /// stays 0 so plain list responses keep their pre-existing
-    /// last-write-wins behavior.
+    /// applied, so stale completions and responses fetched under an obsolete
+    /// Headless policy cannot clobber newer results. Shared by the welcome
+    /// picker and the agent modal; per-incarnation generation additionally
+    /// prevents responses from crossing close/reopen or host boundaries.
     pub session_picker_list_seq: u64,
     /// Resolved compat-session cells used before checking resume-skill paths.
     pub(crate) foreign_session_compat: xai_grok_foreign_sessions::EnabledForeignSessionSources,
@@ -968,8 +995,24 @@ pub struct AppView {
     pub(crate) foreign_scan_coordinator: crate::app::ForeignScanCoordinator,
     /// Foreign lane completion and deferred native-lane notice.
     pub(crate) session_picker_lanes: crate::views::session_picker::SessionPickerLanes,
-    /// Invalidates detail reads when picker rows or filters change.
-    pub(crate) session_picker_detail_generation: u64,
+    /// Invalidates the welcome picker's in-flight card-detail reads when its
+    /// rows or filters change.
+    pub(crate) session_picker_detail_seq: u64,
+    /// Allocator for picker incarnation generations. Starts at 0; the first
+    /// allocation returns 1, so a freshly-constructed modal's 0 placeholder
+    /// can never collide with an allocated generation (no producer stamps a
+    /// request before the allocator runs).
+    pub(crate) picker_generation_counter: u64,
+    /// Generation of the welcome picker's current incarnation. Reallocated by
+    /// every browse fetch (the `Action::FetchSessionList` dispatcher) and
+    /// every picker dismissal, so results issued for a superseded incarnation
+    /// no longer match. Searches and debounce re-emissions read it and never
+    /// reallocate.
+    pub(crate) session_picker_generation: u64,
+    /// Dashboard session picker surface. `None` while unmounted; the
+    /// dashboard host constructs it on open and drops it on dismiss.
+    pub(crate) dashboard_session_picker:
+        Option<crate::views::session_picker_surface::SessionPickerSurface>,
     /// The search query `session_picker_entries` were server-fetched with
     /// (`None` = unfiltered fetch). Via
     /// [`crate::views::session_picker::effective_filter_query`], skips the
@@ -1300,6 +1343,13 @@ impl AppView {
             pending.abandon();
         }
     }
+    /// Next picker incarnation generation. One app-wide monotone counter, so
+    /// generations are unique across all picker hosts and a result can never
+    /// match a different host's live incarnation.
+    pub(crate) fn alloc_picker_generation(&mut self) -> u64 {
+        self.picker_generation_counter += 1;
+        self.picker_generation_counter
+    }
     pub fn is_zdr_blocked(&self) -> bool {
         self.is_zdr && !self.zdr_access_enabled
     }
@@ -1593,7 +1643,10 @@ impl AppView {
             foreign_session_scan_seq: 0,
             foreign_scan_coordinator: Default::default(),
             session_picker_lanes: Default::default(),
-            session_picker_detail_generation: 0,
+            session_picker_detail_seq: 0,
+            picker_generation_counter: 0,
+            session_picker_generation: 0,
+            dashboard_session_picker: None,
             session_picker_entries_query: None,
             session_picker_pending_delete: None,
             welcome_tick: 0,
@@ -1704,6 +1757,14 @@ impl AppView {
             leader_roster: Vec::new(),
             dashboard_local_sessions: Vec::new(),
             dashboard_sessions_loading: false,
+            workspace_store: None,
+            workspace_snapshot: None,
+            workspace_store_loading: false,
+            workspace_sync_requested: false,
+            workspace_write_in_flight: false,
+            workspace_writes_disabled: false,
+            workspace_retry_metadata: std::collections::HashMap::new(),
+            workspace_failed_metadata: std::collections::HashMap::new(),
             shared_prompt_queues: std::collections::HashMap::new(),
             optimistic_prompt_echoes: std::collections::HashMap::new(),
             pending_running_adoptions: std::collections::HashMap::new(),
@@ -5075,6 +5136,8 @@ impl AppView {
                                 registry,
                                 pending_hint,
                                 dashboard_roster,
+                                self.workspace_dashboard_enabled,
+                                self.workspace_snapshot.as_ref(),
                                 self.dashboard_sessions_loading,
                                 dash_upgrade_cta,
                             );
