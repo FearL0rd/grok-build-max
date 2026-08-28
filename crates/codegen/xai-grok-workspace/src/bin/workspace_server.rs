@@ -305,6 +305,7 @@ fn main() -> anyhow::Result<()> {
 /// Always-on success must arm so children do not inherit -900. `--oom-protect`
 /// forces the env even when the early write failed (pre-unshare may still have
 /// left the score at -900).
+#[cfg(unix)]
 fn should_set_reset_child_oom(early_protect_ok: bool, oom_protect_flag: bool) -> bool {
     early_protect_ok || oom_protect_flag
 }
