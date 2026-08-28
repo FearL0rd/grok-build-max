@@ -790,24 +790,25 @@ pub(super) fn handle_providers_done(
     let Some(agent) = app.agents.get_mut(&agent_id) else {
         return vec![];
     };
-    match result {
-        Err(e) => agent.show_toast(&e),
-        Ok(()) => {
-            let Some(ref mut modal) = agent.providers_modal else {
-                return vec![];
-            };
-            let rebuilt = crate::views::providers_modal::build_providers_modal_state(
-                &agent
-                    .session
-                    .models
-                    .current_model_name()
-                    .unwrap_or_else(|| "grok".to_string()),
-            );
-            modal.entries = rebuilt.entries;
-            if modal.selected >= modal.entries.len() {
-                modal.selected = modal.entries.len().saturating_sub(1);
-            }
-        }
+    // The panel mirrors config.toml, not runtime state: the write already
+    // succeeded, so refresh the rows even when the session reload failed
+    // (the error still surfaces as a toast).
+    if let Err(e) = &result {
+        agent.show_toast(e);
+    }
+    let Some(ref mut modal) = agent.providers_modal else {
+        return vec![];
+    };
+    let rebuilt = crate::views::providers_modal::build_providers_modal_state(
+        &agent
+            .session
+            .models
+            .current_model_name()
+            .unwrap_or_else(|| "grok".to_string()),
+    );
+    modal.entries = rebuilt.entries;
+    if modal.selected >= modal.entries.len() {
+        modal.selected = modal.entries.len().saturating_sub(1);
     }
     vec![]
 }

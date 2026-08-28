@@ -40,6 +40,7 @@ pub fn build_providers_modal_state(active_model: &str) -> ProvidersModalState {
         input: LineEditor::default(),
         pending_base_url: None,
         pending_name: None,
+        pending_api_key: None,
     }
 }
 
@@ -68,11 +69,13 @@ fn provider_rows(cfg: &AgentConfig, active_model: &str) -> Vec<ProviderRow> {
                 || (override_.is_none() && preset.is_none())
                 || name.eq_ignore_ascii_case("grok");
             let keyless = override_.is_some_and(|o| o.keyless) || preset.is_some_and(|p| p.keyless);
+            let model = override_.and_then(|o| o.model.clone());
             ProviderRow {
                 name: name.clone(),
                 base_url,
                 has_key,
                 keyless,
+                model,
                 is_active: name == active_model,
             }
         })
@@ -88,6 +91,8 @@ pub struct ProviderRow {
     pub has_key: bool,
     /// Providers that need no key (Ollama-style local servers).
     pub keyless: bool,
+    /// The entry's model id from `[model.<name>].model`, when set.
+    pub model: Option<String>,
     /// Matches the session's currently-selected model.
     pub is_active: bool,
 }
@@ -99,13 +104,16 @@ pub enum EditField {
     ApiKey,
     /// Add-flow only: the `[model.<name>]` config key.
     ModelName,
+    /// The provider's model id (`model = "..."` in `[model.<name>]`).
+    Model,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModalMode {
     Normal,
     /// Text input focused. `add` = creating a new provider (name ->
-    /// base_url -> api_key); otherwise editing the selected row.
+    /// base_url -> api_key -> model); otherwise editing the selected row
+    /// (base_url -> api_key -> model).
     Editing {
         add: bool,
         field: EditField,
@@ -150,6 +158,9 @@ pub struct ProvidersModalState {
     /// Fields captured earlier in the current add/edit flow.
     pub(crate) pending_base_url: Option<String>,
     pub(crate) pending_name: Option<String>,
+    /// `None` means "keep existing" in the edit flow; add flow stores the
+    /// typed key here between the api_key and model steps.
+    pub(crate) pending_api_key: Option<String>,
 }
 
 impl ProvidersModalState {
@@ -178,6 +189,7 @@ impl ProvidersModalState {
         self.input.set_text("");
         self.pending_base_url = None;
         self.pending_name = None;
+        self.pending_api_key = None;
         self.mode = ModalMode::Editing {
             add: true,
             field: EditField::ModelName,
@@ -188,6 +200,7 @@ impl ProvidersModalState {
         self.input.set_text("");
         self.pending_base_url = None;
         self.pending_name = None;
+        self.pending_api_key = None;
         self.mode = ModalMode::Editing { add: false, field };
     }
 
@@ -196,6 +209,7 @@ impl ProvidersModalState {
         self.input.set_text("");
         self.pending_base_url = None;
         self.pending_name = None;
+        self.pending_api_key = None;
     }
 
     fn preset_for(&self, name: &str) -> Option<&'static ProviderPreset> {
@@ -282,36 +296,51 @@ fn confirm_field(state: &mut ProvidersModalState) -> ProvidersOutcome {
             };
             ProvidersOutcome::Changed
         }
-        // Add step 2: base_url (preset default prefilled).
+        // Add step 2: base_url (preset default prefilled). Keyless presets
+        // skip straight to the model step.
         (true, EditField::BaseUrl) => {
             if text.is_empty() {
                 return ProvidersOutcome::Changed;
             }
+            let keyless = state
+                .pending_name
+                .as_deref()
+                .and_then(|n| state.preset_for(n))
+                .is_some_and(|p| p.keyless);
             state.pending_base_url = Some(text);
-            state.input.set_text("");
-            state.mode = ModalMode::Editing {
-                add: true,
-                field: EditField::ApiKey,
-            };
+            if keyless {
+                prefill_model_step(state, true);
+            } else {
+                state.input.set_text("");
+                state.mode = ModalMode::Editing {
+                    add: true,
+                    field: EditField::ApiKey,
+                };
+            }
             ProvidersOutcome::Changed
         }
-        // Add step 3: api_key (empty = none; keyless presets never ask).
+        // Add step 3: api_key (empty = none; keyless presets skip this step).
         (true, EditField::ApiKey) => {
+            let api_key = if text.is_empty() { None } else { Some(text) };
+            state.pending_api_key = api_key;
+            prefill_model_step(state, true);
+            ProvidersOutcome::Changed
+        }
+        // Add step 4: model id (preset default prefilled; Enter accepts it).
+        (true, EditField::Model) => {
             let Some(name) = state.pending_name.clone() else {
                 state.cancel_edit();
                 return ProvidersOutcome::Changed;
             };
-            let base_url = state.pending_base_url.clone().unwrap_or_default();
             let preset = state.preset_for(&name);
             let keyless = preset.is_some_and(|p| p.keyless);
-            let api_key = if keyless || text.is_empty() {
-                None
+            let model = if text.is_empty() {
+                default_model(preset, &name)
             } else {
-                Some(text)
+                text
             };
-            let model = preset
-                .map(|p| p.suggested_model.to_string())
-                .unwrap_or_else(|| name.clone());
+            let base_url = state.pending_base_url.clone().unwrap_or_default();
+            let api_key = state.pending_api_key.take();
             state.cancel_edit();
             ProvidersOutcome::Op(ProvidersOp::Upsert {
                 name,
@@ -321,7 +350,7 @@ fn confirm_field(state: &mut ProvidersModalState) -> ProvidersOutcome {
                 keyless,
             })
         }
-        // Edit: base_url first, then api_key.
+        // Edit: base_url, then api_key, then model.
         (false, EditField::BaseUrl) => {
             if text.is_empty() {
                 return ProvidersOutcome::Changed;
@@ -335,21 +364,30 @@ fn confirm_field(state: &mut ProvidersModalState) -> ProvidersOutcome {
             ProvidersOutcome::Changed
         }
         (false, EditField::ApiKey) => {
+            // Empty input keeps the existing key; typing replaces it.
+            let api_key = if text.is_empty() { None } else { Some(text) };
+            state.pending_api_key = api_key;
+            prefill_model_step(state, false);
+            ProvidersOutcome::Changed
+        }
+        (false, EditField::Model) => {
             let Some(row) = state.entries.get(state.selected).cloned() else {
                 state.cancel_edit();
                 return ProvidersOutcome::Changed;
+            };
+            let preset = state.preset_for(&row.name);
+            let keyless = row.keyless || preset.is_some_and(|p| p.keyless);
+            let model = if text.is_empty() {
+                row.model.clone().unwrap_or_else(|| default_model(preset, &row.name))
+            } else {
+                text
             };
             let base_url = state
                 .pending_base_url
                 .clone()
                 .unwrap_or_else(|| row.base_url.clone());
-            let preset = state.preset_for(&row.name);
-            let keyless = row.keyless || preset.is_some_and(|p| p.keyless);
-            // Empty input keeps the existing key; typing replaces it.
-            let api_key = if text.is_empty() { None } else { Some(text) };
-            let model = preset
-                .map(|p| p.suggested_model.to_string())
-                .unwrap_or_else(|| row.name.clone());
+            // None means "keep current key" at the writer level.
+            let api_key = state.pending_api_key.take();
             state.cancel_edit();
             ProvidersOutcome::Op(ProvidersOp::Upsert {
                 name: row.name,
@@ -362,6 +400,38 @@ fn confirm_field(state: &mut ProvidersModalState) -> ProvidersOutcome {
         // ModelName is add-flow only; edit never targets it.
         (false, EditField::ModelName) => ProvidersOutcome::Unchanged,
     }
+}
+
+/// Prefill for the model step: presets suggest their model, custom entries
+/// default to the config name.
+fn default_model(preset: Option<&'static ProviderPreset>, name: &str) -> String {
+    preset
+        .map(|p| p.suggested_model.to_string())
+        .unwrap_or_else(|| name.to_owned())
+}
+
+/// Enter the model step, prefilled with the row's current model (edit) or the
+/// preset/name default (add).
+fn prefill_model_step(state: &mut ProvidersModalState, add: bool) {
+    let current = if add {
+        let name = state.pending_name.clone().unwrap_or_default();
+        default_model(state.preset_for(&name), &name)
+    } else {
+        state
+            .entries
+            .get(state.selected)
+            .map(|r| {
+                r.model
+                    .clone()
+                    .unwrap_or_else(|| default_model(state.preset_for(&r.name), &r.name))
+            })
+            .unwrap_or_default()
+    };
+    state.input.set_text(&current);
+    state.mode = ModalMode::Editing {
+        add,
+        field: EditField::Model,
+    };
 }
 
 /// Keys while the text input is focused.
@@ -415,6 +485,7 @@ fn edit_prompt(state: &ProvidersModalState) -> String {
         (true, EditField::ModelName) => "name (e.g. openai, ollama-local): ".to_owned(),
         (true, EditField::BaseUrl) => "base_url: ".to_owned(),
         (true, EditField::ApiKey) => "api_key (empty = none): ".to_owned(),
+        (true, EditField::Model) => "model (Enter = default): ".to_owned(),
         (false, EditField::BaseUrl) => "base_url: ".to_owned(),
         (false, EditField::ApiKey) => {
             if state.entries.get(state.selected).is_some_and(|r| r.has_key) {
@@ -423,6 +494,7 @@ fn edit_prompt(state: &ProvidersModalState) -> String {
                 "api_key: ".to_owned()
             }
         }
+        (false, EditField::Model) => "model (empty = keep): ".to_owned(),
         (false, EditField::ModelName) => String::new(),
     }
 }
@@ -671,6 +743,7 @@ mod tests {
                     has_key: i % 2 == 1,
                     is_active: false,
                     keyless: false,
+                    model: None,
                 })
                 .collect(),
             selected: 0,
@@ -681,6 +754,7 @@ mod tests {
             input: LineEditor::default(),
             pending_base_url: None,
             pending_name: None,
+            pending_api_key: None,
         }
     }
 
@@ -834,6 +908,26 @@ mod tests {
         for ch in "sk-test".chars() {
             let _ = handle_providers_key(&mut st, &key(KeyCode::Char(ch)));
         }
+        // api_key confirm moves to the model step, prefilled with the
+        // preset's suggested model.
+        assert_eq!(
+            handle_providers_key(&mut st, &key(KeyCode::Enter)),
+            ProvidersOutcome::Changed
+        );
+        assert_eq!(
+            st.mode,
+            ModalMode::Editing {
+                add: true,
+                field: EditField::Model
+            }
+        );
+        let default_model = PRESETS
+            .iter()
+            .find(|p| p.short_key == "openai")
+            .map(|p| p.suggested_model.to_string())
+            .unwrap();
+        assert_eq!(st.input.text(), default_model);
+        // Enter accepts the prefill.
         let outcome = handle_providers_key(&mut st, &key(KeyCode::Enter));
         assert_eq!(
             outcome,
@@ -841,15 +935,96 @@ mod tests {
                 name: "openai".into(),
                 base_url: "https://api.openai.com/v1".into(),
                 api_key: Some("sk-test".into()),
-                model: PRESETS
-                    .iter()
-                    .find(|p| p.short_key == "openai")
-                    .map(|p| p.suggested_model.to_string())
-                    .unwrap(),
+                model: default_model,
                 keyless: false,
             })
         );
         assert_eq!(st.mode, ModalMode::Normal);
+    }
+
+    #[test]
+    fn add_flow_model_step_accepts_custom_model() {
+        let mut st = state_with_rows(1);
+        handle_providers_key(&mut st, &key(KeyCode::Char('a')));
+        for ch in "openai".chars() {
+            let _ = handle_providers_key(&mut st, &key(KeyCode::Char(ch)));
+        }
+        let _ = handle_providers_key(&mut st, &key(KeyCode::Enter)); // name
+        let _ = handle_providers_key(&mut st, &key(KeyCode::Enter)); // base_url
+        for ch in "sk-x".chars() {
+            let _ = handle_providers_key(&mut st, &key(KeyCode::Char(ch)));
+        }
+        let _ = handle_providers_key(&mut st, &key(KeyCode::Enter)); // api_key
+        st.input.set_text(""); // replace the preset prefill
+        for ch in "gpt-4o-mini".chars() {
+            let _ = handle_providers_key(&mut st, &key(KeyCode::Char(ch)));
+        }
+        let outcome = handle_providers_key(&mut st, &key(KeyCode::Enter)); // model
+        match outcome {
+            ProvidersOutcome::Op(ProvidersOp::Upsert { model, api_key, .. }) => {
+                assert_eq!(model, "gpt-4o-mini");
+                assert_eq!(api_key, Some("sk-x".into()));
+            }
+            other => panic!("expected Upsert op, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_flow_keyless_skips_api_key_step() {
+        let mut st = state_with_rows(1);
+        handle_providers_key(&mut st, &key(KeyCode::Char('a')));
+        for ch in "ollama-local".chars() {
+            let _ = handle_providers_key(&mut st, &key(KeyCode::Char(ch)));
+        }
+        let _ = handle_providers_key(&mut st, &key(KeyCode::Enter)); // name
+        let _ = handle_providers_key(&mut st, &key(KeyCode::Enter)); // base_url
+        assert_eq!(
+            st.mode,
+            ModalMode::Editing {
+                add: true,
+                field: EditField::Model
+            },
+            "keyless preset must skip the api_key step"
+        );
+        let outcome = handle_providers_key(&mut st, &key(KeyCode::Enter)); // model
+        match outcome {
+            ProvidersOutcome::Op(ProvidersOp::Upsert {
+                api_key, keyless, ..
+            }) => {
+                assert_eq!(api_key, None);
+                assert!(keyless);
+            }
+            other => panic!("expected Upsert op, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn edit_flow_preserves_existing_model() {
+        let mut st = state_with_rows(1);
+        st.entries[0].model = Some("my-model-v2".into());
+        handle_providers_key(&mut st, &key(KeyCode::Char('e')));
+        for ch in "https://proxy.example/v1".chars() {
+            let _ = handle_providers_key(&mut st, &key(KeyCode::Char(ch)));
+        }
+        let _ = handle_providers_key(&mut st, &key(KeyCode::Enter)); // base_url
+        let _ = handle_providers_key(&mut st, &key(KeyCode::Enter)); // api_key empty = keep
+        // Model step prefilled with the existing model; empty Enter keeps it.
+        assert_eq!(
+            st.mode,
+            ModalMode::Editing {
+                add: false,
+                field: EditField::Model
+            }
+        );
+        assert_eq!(st.input.text(), "my-model-v2");
+        let outcome = handle_providers_key(&mut st, &key(KeyCode::Enter));
+        match outcome {
+            ProvidersOutcome::Op(ProvidersOp::Upsert { model, base_url, .. }) => {
+                assert_eq!(model, "my-model-v2");
+                assert_eq!(base_url, "https://proxy.example/v1");
+            }
+            other => panic!("expected Upsert op, got {other:?}"),
+        }
     }
 
     #[test]
@@ -863,6 +1038,8 @@ mod tests {
         let _ = handle_providers_key(&mut st, &key(KeyCode::Enter));
         // Empty api_key input keeps the existing key (api_key: None means
         // "keep" at the op level; the writer preserves it upstream).
+        let _ = handle_providers_key(&mut st, &key(KeyCode::Enter));
+        // Empty model input keeps the row's model (prefill accepted).
         let outcome = handle_providers_key(&mut st, &key(KeyCode::Enter));
         match outcome {
             ProvidersOutcome::Op(ProvidersOp::Upsert {
@@ -921,6 +1098,7 @@ order = ["grok", "openai", "ollama-local"]
 [model.openai]
 api_key = "sk-test"
 base_url = "https://custom.openai/v1"
+model = "gpt-x"
 
 [model.ollama-local]
 keyless = true
@@ -932,6 +1110,7 @@ keyless = true
         assert!(rows[0].has_key && rows[0].is_active);
         // User base_url wins over the preset default.
         assert_eq!(rows[1].base_url, "https://custom.openai/v1");
+        assert_eq!(rows[1].model.as_deref(), Some("gpt-x"));
         assert!(rows[1].has_key && !rows[1].is_active);
         assert!(rows[2].keyless && !rows[2].has_key);
         assert_eq!(rows[2].base_url, "http://localhost:11434/v1");
