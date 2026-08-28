@@ -120,7 +120,7 @@ case ":$PATH:" in
     if [ ! -f "$HOME/.profile" ] && [ ! -f "$HOME/.bashrc" ] && [ ! -f "$HOME/.zshrc" ] && [ ! -f "$HOME/.zshenv" ]; then
       : > "$HOME/.zshenv"
     fi
-    for profile in "$HOME/.profile" "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.zshenv"; do
+    for profile in "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.zshenv"; do
       if [ -f "$profile" ] && ! grep -qs "$BIN_DIR" "$profile"; then
         printf '\nexport PATH="%s:$PATH"\n' "$BIN_DIR" >> "$profile"
         warn "added $BIN_DIR to PATH in $profile — restart your shell or: export PATH=\"$BIN_DIR:\$PATH\""
