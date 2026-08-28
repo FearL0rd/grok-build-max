@@ -57,7 +57,12 @@ fi
 # --- build -------------------------------------------------------------------
 
 say "Building Grok Build Max (release) — first build can take several minutes..."
-( cd "$SRC_DIR" && cargo build --release -p xai-grok-pager-bin )
+if ! ( cd "$SRC_DIR" && cargo build --release -p xai-grok-pager-bin ); then
+  warn "build failed"
+  warn "if the log mentions protoc, install a system protoc and re-run:"
+  warn "  apt install protobuf-compiler | brew install protobuf | dnf install protobuf-compiler"
+  exit 1
+fi
 
 BUILT="$SRC_DIR/target/release/grokmax"
 [ -f "$BUILT" ] || die "build finished but binary missing at $BUILT"

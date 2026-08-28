@@ -80,7 +80,11 @@ grokmax --version
 
 Both scripts clone this repository to `~/.grokmax/src` (skipped if it already
 exists), build the release binary with `cargo build --release -p
-xai-grok-pager-bin`, and install it as `grokmax`:
+xai-grok-pager-bin`, and install it as `grokmax`. The Windows installer also
+downloads a protoc release automatically (the repo's `bin/protoc` DotSlash
+wrapper has no Windows entry), and requires the
+[Visual Studio C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
+for linking:
 
 - macOS/Linux: `/usr/local/bin` when writable, else `~/.local/bin` (added to
   `PATH` in your shell profile when needed).
