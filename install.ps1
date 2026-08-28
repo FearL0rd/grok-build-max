@@ -46,23 +46,48 @@ if (-not (Get-Command protoc -ErrorAction SilentlyContinue) -and -not $env:PROTO
 }
 
 # --- fetch -------------------------------------------------------------------
+# NOTE: Windows PowerShell 5.1 turns native-command stderr (git progress, cargo
+# "Compiling" lines) into terminating NativeCommandErrors when it is redirected
+# under $ErrorActionPreference = 'Stop'. Run native tools with 'Continue' and
+# check $LASTEXITCODE explicitly instead of redirecting stderr.
+
+function Invoke-Native {
+  param([scriptblock]$Command)
+  $prev = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try { & $Command } finally { $ErrorActionPreference = $prev }
+  return $LASTEXITCODE
+}
 
 New-Item -ItemType Directory -Force -Path $GrokmaxHome | Out-Null
 if (Test-Path (Join-Path $SrcDir '.git')) {
   Write-Host "Updating existing clone at $SrcDir..."
-  git -C $SrcDir fetch --depth 1 origin $Ref
-  git -C $SrcDir checkout -q FETCH_HEAD
+  $rc = Invoke-Native { git -C $SrcDir fetch --quiet --depth 1 origin $Ref }
+  if ($rc -ne 0) { Fail "git fetch failed (exit $rc)" }
+  $rc = Invoke-Native { git -C $SrcDir checkout --quiet FETCH_HEAD }
+  if ($rc -ne 0) { Fail "git checkout failed (exit $rc)" }
 } else {
+  # A previous interrupted run can leave a partial clone behind - remove it.
+  if (Test-Path $SrcDir) {
+    Write-Host "Removing incomplete clone at $SrcDir..."
+    Remove-Item -Recurse -Force $SrcDir
+  }
   Write-Host "Cloning $RepoUrl ($Ref) to $SrcDir..."
-  git clone --depth 1 --branch $Ref $RepoUrl $SrcDir 2>$null
-  if (-not (Test-Path $SrcDir)) { git clone --depth 1 $RepoUrl $SrcDir }
+  $rc = Invoke-Native { git clone --quiet --depth 1 --branch $Ref $RepoUrl $SrcDir }
+  if ($rc -ne 0) {
+    $rc = Invoke-Native { git clone --quiet --depth 1 $RepoUrl $SrcDir }
+    if ($rc -ne 0) { Fail "git clone failed (exit $rc)" }
+  }
 }
 
 # --- build -------------------------------------------------------------------
 
 Write-Host 'Building Grok Build Max (release) - first build can take several minutes...'
 Push-Location $SrcDir
-try { cargo build --release -p xai-grok-pager-bin } finally { Pop-Location }
+try {
+  $rc = Invoke-Native { cargo build --release -p xai-grok-pager-bin }
+  if ($rc -ne 0) { Fail "cargo build failed (exit $rc)" }
+} finally { Pop-Location }
 
 $Built = Join-Path $SrcDir 'target\release\grokmax.exe'
 if (-not (Test-Path $Built)) { Fail "build finished but binary missing at $Built" }
