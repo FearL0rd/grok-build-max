@@ -22,9 +22,12 @@
 > active provider dies mid-conversation (quota exhausted, auth failure, fatal
 > server error), Grok Build Max silently rolls over to the next provider in
 > your ordered failover list, before any output is produced, and tells you it
-> did so. API keys live **only** in `config.toml` — never in `.env` files.
+> did so. API keys live **only** in `config.toml`.
 
 <div align="center">
+
+<img width="1067" height="447" alt="image" src="https://github.com/user-attachments/assets/45e87bd9-6323-402f-a91d-af727430b8f4" />
+
 
 **Grok Build** is SpaceXAI's terminal-based AI coding agent. It runs as a
 full-screen TUI that understands your codebase, edits files, executes shell
