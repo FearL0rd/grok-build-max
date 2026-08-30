@@ -6,8 +6,8 @@
 //! payloads come from `xai_grok_test_support::sse`.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::Router;
@@ -1610,6 +1610,57 @@ async fn chain_rolls_over_on_fatal_before_output() {
         "{terminal:?}"
     );
     assert!(saw_rollover);
+    server.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chain_rollover_restamps_provider_model_name() {
+    // The request carries the chain's starting model ("d"). The backup
+    // provider's config says "b" — the rolled-over entry must send "b",
+    // not the primary's model name.
+    let seen_models: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen = seen_models.clone();
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move |body: axum::Json<serde_json::Value>| {
+            let model = body
+                .0
+                .get("model")
+                .and_then(|m| m.as_str())
+                .unwrap_or_default()
+                .to_string();
+            seen.lock().unwrap().push(model);
+            async move {
+                let events = sse::chat_completion_events("ok", "test-model");
+                Sse::new(stream::iter(
+                    events.into_iter().map(Ok::<_, std::convert::Infallible>),
+                ))
+            }
+        }),
+    );
+    let server = MockServer::spawn(app).await;
+    let dead = "http://127.0.0.1:9/v1";
+    let chain = vec![
+        ("dead".to_string(), test_config(dead.to_string(), "d")),
+        ("alive".to_string(), test_config(server.base_url(), "b")),
+    ];
+
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let handle = SamplerActor::spawn(
+        test_config(dead.to_string(), "seed"),
+        RetryPolicy::default(),
+        event_tx,
+    );
+    handle.update_chain(chain);
+    let mut req = user_request("hello");
+    req.model = Some("d".to_string()); // production: shell sets the selected model
+    handle.submit(RequestId::from("chain-model"), req);
+
+    match recv_until_chain_terminal(&mut event_rx).await {
+        SamplingEvent::Completed { .. } => {}
+        other => panic!("expected Completed, got {other:?}"),
+    }
+    assert_eq!(*seen_models.lock().unwrap(), vec!["b".to_string()]);
     server.shutdown();
 }
 

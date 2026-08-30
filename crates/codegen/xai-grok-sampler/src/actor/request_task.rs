@@ -287,6 +287,10 @@ async fn run_one_provider(
     }
 
     let mut request = request;
+    // The incoming request carries the chain's starting model. On rollover
+    // this entry is a different provider, so re-stamp its own model name —
+    // otherwise entry #2 would receive provider #1's model.
+    request.model = Some(config.model.clone());
     let mut retry_count: u32 = 0;
     // Doom-loop recovery keeps its own resample budget, independent of the
     // transport/empty budget above.
