@@ -378,7 +378,9 @@ fn confirm_field(state: &mut ProvidersModalState) -> ProvidersOutcome {
             let preset = state.preset_for(&row.name);
             let keyless = row.keyless || preset.is_some_and(|p| p.keyless);
             let model = if text.is_empty() {
-                row.model.clone().unwrap_or_else(|| default_model(preset, &row.name))
+                row.model
+                    .clone()
+                    .unwrap_or_else(|| default_model(preset, &row.name))
             } else {
                 text
             };
@@ -1019,7 +1021,9 @@ mod tests {
         assert_eq!(st.input.text(), "my-model-v2");
         let outcome = handle_providers_key(&mut st, &key(KeyCode::Enter));
         match outcome {
-            ProvidersOutcome::Op(ProvidersOp::Upsert { model, base_url, .. }) => {
+            ProvidersOutcome::Op(ProvidersOp::Upsert {
+                model, base_url, ..
+            }) => {
                 assert_eq!(model, "my-model-v2");
                 assert_eq!(base_url, "https://proxy.example/v1");
             }

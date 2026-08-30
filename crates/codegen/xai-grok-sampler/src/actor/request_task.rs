@@ -769,7 +769,11 @@ pub(crate) async fn run_request_task(
                     LoopControl::Terminal(terminal_error) => {
                         let terminal_event_queued =
                             emit_failed(&event_tx, &request_id, &terminal_error);
-                        send_completion(&mut completion, Err(terminal_error), terminal_event_queued);
+                        send_completion(
+                            &mut completion,
+                            Err(terminal_error),
+                            terminal_event_queued,
+                        );
                         return request_id;
                     }
                     LoopControl::Cancelled => {
@@ -805,7 +809,11 @@ pub(crate) async fn run_request_task(
                     LoopControl::Terminal(terminal_error) => {
                         let terminal_event_queued =
                             emit_failed(&event_tx, &request_id, &terminal_error);
-                        send_completion(&mut completion, Err(terminal_error), terminal_event_queued);
+                        send_completion(
+                            &mut completion,
+                            Err(terminal_error),
+                            terminal_event_queued,
+                        );
                         return request_id;
                     }
                     LoopControl::Cancelled => {
@@ -1474,10 +1482,7 @@ fn emit_images_stripped(
 /// Emit the terminal "request cancelled" Failed event without touching
 /// the completion channel — used where the caller owns completion
 /// handling (failover chain walker).
-fn emit_cancelled(
-    event_tx: &mpsc::UnboundedSender<SamplingEvent>,
-    request_id: &RequestId,
-) -> bool {
+fn emit_cancelled(event_tx: &mpsc::UnboundedSender<SamplingEvent>, request_id: &RequestId) -> bool {
     let info = SamplingErrorInfo {
         kind: SamplingErrorKind::Api,
         status_code: None,
