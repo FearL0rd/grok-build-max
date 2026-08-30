@@ -191,8 +191,14 @@ pub enum SamplingEvent {
     /// the next provider.
     ProviderRolledOver {
         request_id: RequestId,
+        /// Config name of the provider that failed (TUI display).
         from: std::sync::Arc<str>,
+        /// Config name of the provider now serving the request (TUI display).
         to: std::sync::Arc<str>,
+        /// Winner's API model id (`SamplerConfig.model`). The session stamps
+        /// this onto `sampling_config.model` so the next sampler submit after
+        /// a tool-permission wait starts at this chain entry, not the original.
+        to_model: std::sync::Arc<str>,
         reason: String,
     },
 

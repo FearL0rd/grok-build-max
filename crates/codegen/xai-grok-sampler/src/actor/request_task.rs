@@ -203,11 +203,12 @@ pub(crate) async fn run_chain_task(
                     send_completion(&mut completion, Err(error), terminal_event_queued);
                     return request_id;
                 }
-                if let Some((_, (next_name, _))) = entries.peek() {
+                if let Some((_, (next_name, next_config))) = entries.peek() {
                     let _ = event_tx.send(SamplingEvent::ProviderRolledOver {
                         request_id: request_id.clone(),
                         from: Arc::from(name.as_str()),
                         to: Arc::from(next_name.as_str()),
+                        to_model: Arc::from(next_config.model.as_str()),
                         reason: error.to_string(),
                     });
                     continue;

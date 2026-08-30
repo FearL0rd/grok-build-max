@@ -538,7 +538,11 @@ impl SessionActor {
                 .await;
             }
             SamplingEvent::ProviderRolledOver {
-                from, to, reason, ..
+                from,
+                to,
+                to_model,
+                reason,
+                ..
             } => {
                 xai_grok_telemetry::unified_log::warn(
                     "shell.turn.provider_rolled_over",
@@ -546,9 +550,18 @@ impl SessionActor {
                     Some(serde_json::json!({
                         "from": from.as_ref(),
                         "to": to.as_ref(),
+                        "to_model": to_model.as_ref(),
                         "reason": crate::util::truncate(&reason, 300),
                     })),
                 );
+                // Stamp the winner's API model id so the next sampler submit
+                // (after a tool-permission wait rebuilds the request from
+                // sampling_config) starts at this chain entry, not grok.
+                if let Some(mut cfg) = self.chat_state_handle.get_sampling_config().await {
+                    cfg.model = to_model.to_string();
+                    self.chat_state_handle.update_sampling_config(cfg);
+                }
+                self.signals_handle().set_primary_model(to_model.as_ref());
                 self.send_xai_notification(XaiSessionUpdate::ProviderRolledOver {
                     from: from.to_string(),
                     to: to.to_string(),

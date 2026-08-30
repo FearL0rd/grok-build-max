@@ -1454,3 +1454,71 @@ async fn reasoning_only_doomloop_turn_captures_every_generation_as_segments() {
         })
         .await;
 }
+
+/// After a rollover the session must stamp the winner's API model id onto
+/// `sampling_config.model`. The next sampler submit (after a tool-permission
+/// wait rebuilds the request from that config) then starts at the rolled-to
+/// chain entry instead of grok.
+#[tokio::test(flavor = "current_thread")]
+async fn provider_rollover_stamps_winner_model_into_sampling_config() {
+    use xai_grok_sampler::{RequestId, SamplingEvent};
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let mut fixture = make_replay_send_update_fixture().await;
+            let (chat_event_tx, _chat_event_rx) = tokio::sync::mpsc::unbounded_channel();
+            fixture.actor.chat_state_handle = xai_chat_state::ChatStateActor::spawn(
+                vec![],
+                xai_grok_sampling_types::SamplingConfig {
+                    base_url: "http://localhost".to_string(),
+                    model: "grok-4".to_string(),
+                    max_completion_tokens: None,
+                    temperature: None,
+                    top_p: None,
+                    api_backend: Default::default(),
+                    extra_headers: Default::default(),
+                    query_params: Default::default(),
+                    env_http_headers: Default::default(),
+                    context_window: std::num::NonZeroU64::new(128_000)
+                        .expect("test context_window must be non-zero"),
+                    reasoning_effort: None,
+                    stream_tool_calls: None,
+                },
+                Box::new(xai_chat_state::NullChatPersistence),
+                chat_event_tx,
+                tokio_util::sync::CancellationToken::new(),
+            );
+            let actor = Arc::new(fixture.actor);
+
+            let before = actor
+                .chat_state_handle
+                .get_sampling_config()
+                .await
+                .expect("chat-state actor alive");
+            assert_eq!(before.model, "grok-4");
+
+            let req = RequestId::random();
+            own_request(&actor, &req);
+            actor
+                .handle_sampling_event(SamplingEvent::ProviderRolledOver {
+                    request_id: req,
+                    from: std::sync::Arc::from("grok"),
+                    to: std::sync::Arc::from("anthropic"),
+                    to_model: std::sync::Arc::from("claude-sonnet-4"),
+                    reason: "429 rate limited".to_string(),
+                })
+                .await;
+
+            let after = actor
+                .chat_state_handle
+                .get_sampling_config()
+                .await
+                .expect("chat-state actor alive");
+            assert_eq!(
+                after.model, "claude-sonnet-4",
+                "rollover must persist the winner's API model id so the next \
+                 sampler submit after a pause starts at that chain entry"
+            );
+        })
+        .await;
+}

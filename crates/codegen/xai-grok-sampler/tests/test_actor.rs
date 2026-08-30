@@ -1595,8 +1595,15 @@ async fn chain_rolls_over_on_fatal_before_output() {
             .expect("timed out")
             .expect("channel closed");
         match ev {
-            SamplingEvent::ProviderRolledOver { from, to, .. } => {
+            SamplingEvent::ProviderRolledOver {
+                from, to, to_model, ..
+            } => {
                 assert_eq!((from.as_ref(), to.as_ref()), ("dead", "alive"));
+                assert_eq!(
+                    to_model.as_ref(),
+                    "a",
+                    "rollover must carry the winner's API model id, not the config name"
+                );
                 saw_rollover = true;
             }
             SamplingEvent::Completed { .. }
