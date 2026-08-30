@@ -197,7 +197,18 @@ impl ProvidersModalState {
     }
 
     fn begin_edit(&mut self, field: EditField) {
-        self.input.set_text("");
+        // Prefill the current value so editing shows what is saved rather
+        // than a blank field. base_url is the only field with a visible
+        // current value here; api_key stays blank (secret; empty = keep).
+        let prefill = match field {
+            EditField::BaseUrl => self
+                .entries
+                .get(self.selected)
+                .map(|r| r.base_url.clone())
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        self.input.set_text(prefill);
         self.pending_base_url = None;
         self.pending_name = None;
         self.pending_api_key = None;
@@ -1000,11 +1011,39 @@ mod tests {
         }
     }
 
+    /// The edit flow prefills base_url with the row's current value; change
+    /// it by clearing the field first (backspaces).
+    fn clear_prefill(st: &mut ProvidersModalState) {
+        assert!(!st.input.text().is_empty(), "base_url should be prefilled");
+        while !st.input.text().is_empty() {
+            let _ = handle_providers_key(st, &key(KeyCode::Backspace));
+        }
+        assert!(st.input.text().is_empty());
+    }
+
+    #[test]
+    fn edit_flow_prefills_current_base_url() {
+        let mut st = state_with_rows(1);
+        handle_providers_key(&mut st, &key(KeyCode::Char('e')));
+        assert_eq!(st.input.text(), "http://p0.example");
+        // Enter accepts the prefill unchanged: Upsert keeps the same url.
+        let _ = handle_providers_key(&mut st, &key(KeyCode::Enter)); // base_url
+        let _ = handle_providers_key(&mut st, &key(KeyCode::Enter)); // api_key keep
+        let outcome = handle_providers_key(&mut st, &key(KeyCode::Enter)); // model
+        match outcome {
+            ProvidersOutcome::Op(ProvidersOp::Upsert { base_url, .. }) => {
+                assert_eq!(base_url, "http://p0.example");
+            }
+            other => panic!("expected Upsert op, got {other:?}"),
+        }
+    }
+
     #[test]
     fn edit_flow_preserves_existing_model() {
         let mut st = state_with_rows(1);
         st.entries[0].model = Some("my-model-v2".into());
         handle_providers_key(&mut st, &key(KeyCode::Char('e')));
+        clear_prefill(&mut st);
         for ch in "https://proxy.example/v1".chars() {
             let _ = handle_providers_key(&mut st, &key(KeyCode::Char(ch)));
         }
@@ -1036,6 +1075,7 @@ mod tests {
         let mut st = state_with_rows(1);
         st.entries[0].has_key = true;
         handle_providers_key(&mut st, &key(KeyCode::Char('e')));
+        clear_prefill(&mut st);
         for ch in "https://proxy.example/v1".chars() {
             let _ = handle_providers_key(&mut st, &key(KeyCode::Char(ch)));
         }
