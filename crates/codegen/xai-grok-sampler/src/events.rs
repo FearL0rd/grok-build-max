@@ -221,7 +221,10 @@ impl SamplingEvent {
             | Self::Failed { request_id, .. }
             | Self::ModelMetadata { request_id, .. }
             | Self::BackendToolCallStarted { request_id, .. }
-            | Self::BackendToolCallCompleted { request_id, .. } => request_id,
+            | Self::BackendToolCallCompleted { request_id, .. }
+            | Self::ProviderSkipped { request_id, .. }
+            | Self::ProviderRolledOver { request_id, .. }
+            | Self::ProviderFailed { request_id, .. } => request_id,
         }
     }
 }
@@ -339,6 +342,7 @@ impl std::str::FromStr for SamplingErrorKind {
             "empty_response" => Self::EmptyResponse,
             "max_tokens_truncation" => Self::MaxTokensTruncation,
             "doom_loop_detected" => Self::DoomLoopDetected,
+            "provider_failed" => Self::ProviderFailed,
             _ => return Err(UnknownSamplingErrorKind),
         })
     }
@@ -626,6 +630,7 @@ mod tests {
             EmptyResponse,
             MaxTokensTruncation,
             DoomLoopDetected,
+            ProviderFailed,
         ];
         for kind in all {
             // Exhaustive match, no `_` arm: a new variant refuses to compile
@@ -634,7 +639,7 @@ mod tests {
             // round-trip-checked; the compiler cannot force those two edits.
             match kind {
                 Auth | Http | Api | Serialization | IdleTimeout | RateLimited | EmptyResponse
-                | MaxTokensTruncation | DoomLoopDetected => {}
+                | MaxTokensTruncation | DoomLoopDetected | ProviderFailed => {}
             }
             assert_eq!(kind.as_str().parse(), Ok(kind));
         }

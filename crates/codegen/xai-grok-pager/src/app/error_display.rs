@@ -66,6 +66,7 @@ impl From<xai_grok_shell::sampling::error::SamplingErrorKind> for WireErrorType 
             K::EmptyResponse => Self::EmptyResponse,
             K::MaxTokensTruncation => Self::MaxTokensTruncation,
             K::DoomLoopDetected => Self::Other,
+            K::ProviderFailed => Self::Other,
         }
     }
 }

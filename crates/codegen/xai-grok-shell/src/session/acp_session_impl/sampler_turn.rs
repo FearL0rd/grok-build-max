@@ -119,7 +119,10 @@ pub(super) fn transient_retry_eligible(error: &xai_grok_sampler::SamplingErrorIn
         | SamplingErrorKind::RateLimited
         | SamplingErrorKind::EmptyResponse
         | SamplingErrorKind::MaxTokensTruncation
-        | SamplingErrorKind::DoomLoopDetected => false,
+        | SamplingErrorKind::DoomLoopDetected
+        // The whole failover chain already retried and rolled over;
+        // re-prompting would just re-walk every exhausted provider.
+        | SamplingErrorKind::ProviderFailed => false,
     }
 }
 

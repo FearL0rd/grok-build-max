@@ -518,6 +518,62 @@ impl SessionActor {
                 )
                 .await;
             }
+            // ── Multi-provider failover ─────────────────────────
+            // Emitted by the sampler's chain walker. The request stays
+            // owned by the turn (same request_id), so these pass the
+            // ownership gate above.
+            SamplingEvent::ProviderSkipped { name, reason, .. } => {
+                xai_grok_telemetry::unified_log::info(
+                    "shell.turn.provider_skipped",
+                    Some(self.session_info.id.0.as_ref()),
+                    Some(serde_json::json!({
+                        "provider": name.as_ref(),
+                        "reason": reason.as_ref(),
+                    })),
+                );
+                self.send_xai_notification(XaiSessionUpdate::ProviderSkipped {
+                    name: name.to_string(),
+                    reason: reason.to_string(),
+                })
+                .await;
+            }
+            SamplingEvent::ProviderRolledOver {
+                from, to, reason, ..
+            } => {
+                xai_grok_telemetry::unified_log::warn(
+                    "shell.turn.provider_rolled_over",
+                    Some(self.session_info.id.0.as_ref()),
+                    Some(serde_json::json!({
+                        "from": from.as_ref(),
+                        "to": to.as_ref(),
+                        "reason": crate::util::truncate(&reason, 300),
+                    })),
+                );
+                self.send_xai_notification(XaiSessionUpdate::ProviderRolledOver {
+                    from: from.to_string(),
+                    to: to.to_string(),
+                    reason: crate::util::truncate(&reason, 300).to_owned(),
+                })
+                .await;
+            }
+            SamplingEvent::ProviderFailed {
+                request_id,
+                providers,
+            } => {
+                xai_grok_telemetry::unified_log::error(
+                    "shell.turn.provider_chain_exhausted",
+                    Some(self.session_info.id.0.as_ref()),
+                    Some(serde_json::json!({
+                        "sampler_request_id": request_id.as_str(),
+                        "providers": providers,
+                    })),
+                );
+                self.signals_handle().record_error_typed("provider_failed");
+                self.send_xai_notification(XaiSessionUpdate::ProviderFailed {
+                    providers: providers.iter().map(|p| p.to_string()).collect(),
+                })
+                .await;
+            }
         }
     }
 }
