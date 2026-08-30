@@ -704,6 +704,11 @@ pub struct AgentSession {
     /// Set when a `RetryState::Failed` carries a 403 credit-limit error, so the error message is suppressed in favour of the upsell modal.
     /// Cleared on `finish_turn`.
     pub credit_limit_blocked: bool,
+    /// True when the failover chain holds nothing but grok, so a credit-limit
+    /// denial is final and the xAI upsell may fire. Snapshotted from config at
+    /// session creation and refreshed after `/providers` edits; any non-grok
+    /// provider in the chain suppresses the upsell in favour of rollover.
+    pub grok_sole_provider: bool,
     /// Set when a rate-limit `RetryState::Exhausted` carries the `subscription:free-usage-exhausted` code.
     /// The PromptResponse handler then shows the free-usage paywall instead of the generic rate-limit message.
     /// Always set together with [`Self::rate_limited`]. Cleared on `finish_turn`.
@@ -1109,6 +1114,7 @@ mod tests {
             rate_limited: false,
             model_incompatible: false,
             credit_limit_blocked: false,
+            grok_sole_provider: true,
             free_usage_blocked: false,
             available_commands: Vec::new(),
             available_commands_generation: 0,

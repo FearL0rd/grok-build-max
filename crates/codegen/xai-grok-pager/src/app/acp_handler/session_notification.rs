@@ -599,6 +599,7 @@ pub(super) fn handle_session_notification_with_origin(
                 model_incompatible: false,
                 credit_limit_blocked: false,
                 free_usage_blocked: false,
+                grok_sole_provider: agent.session.grok_sole_provider,
                 bg_tasks: std::collections::BTreeMap::new(),
                 bg_tool_call_to_task: std::collections::HashMap::new(),
                 scheduled_tasks: std::collections::HashMap::new(),
@@ -1664,7 +1665,8 @@ pub(super) fn apply_retry_state(
                     },
                 );
             }
-            is_credit_limit = super::super::dispatch::is_credit_limit_error(None, reason);
+            is_credit_limit = session.grok_sole_provider
+                && super::super::dispatch::is_credit_limit_error(None, reason);
             let is_free_usage = *rate_limited
                 && xai_grok_shell::sampling::error::is_free_usage_exhausted_error(reason);
             if is_credit_limit {
@@ -1698,7 +1700,8 @@ pub(super) fn apply_retry_state(
             if wire == crate::app::error_display::WireErrorType::EncryptedContentMismatch {
                 session.model_incompatible = true;
             }
-            is_credit_limit = super::super::dispatch::is_credit_limit_error(None, message);
+            is_credit_limit = session.grok_sole_provider
+                && super::super::dispatch::is_credit_limit_error(None, message);
             if is_credit_limit {
                 session.credit_limit_blocked = true;
             } else if is_reauthable_failure(Some(error_type.as_str()), message) {

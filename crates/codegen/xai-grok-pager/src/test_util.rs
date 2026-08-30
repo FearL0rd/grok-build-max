@@ -26,6 +26,7 @@ pub fn make_agent_view(session_id: Option<&str>, cwd: &str) -> crate::app::agent
         model_incompatible: false,
         credit_limit_blocked: false,
         free_usage_blocked: false,
+        grok_sole_provider: true,
         available_commands: Vec::new(),
         available_commands_generation: 0,
         available_tools: None,

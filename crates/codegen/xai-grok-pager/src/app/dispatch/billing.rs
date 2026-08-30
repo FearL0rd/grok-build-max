@@ -60,6 +60,30 @@ pub(super) fn credit_limit_upsell_mode(
     }
 }
 
+/// True when every `[failover].order` entry is grok. An empty order means
+/// there is no chain to roll over to, which also counts as sole provider.
+pub(crate) fn order_is_grok_only(order: &[String]) -> bool {
+    order.iter().all(|name| name.eq_ignore_ascii_case("grok"))
+}
+
+/// True when the failover chain holds nothing but grok, so a credit-limit
+/// denial is final. With any other provider in `[failover].order` the sampler
+/// rolls over instead, and the xAI upsell must not fire. Unreadable/unparseable
+/// config falls back to sole provider (legacy upsell behavior).
+///
+/// Read fresh from config when a session is created and after `/providers`
+/// edits; the value is snapshotted onto `AgentSession` so turn-time checks
+/// stay deterministic (and tests never touch the user's real config).
+pub(crate) fn grok_is_sole_provider() -> bool {
+    let Ok(raw) = xai_grok_shell::config::load_effective_config() else {
+        return true;
+    };
+    let Ok(cfg) = xai_grok_shell::agent::config::Config::new_from_toml_cfg(&raw) else {
+        return true;
+    };
+    order_is_grok_only(&cfg.failover.order)
+}
+
 /// Whether an API or retry error is a credit-limit or spend-block denial.
 ///
 /// - 402 Payment Required always means a credit or spend block here (Build pool and IC spend blocks); no message filter.

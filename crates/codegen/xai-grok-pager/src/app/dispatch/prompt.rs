@@ -1189,7 +1189,7 @@ pub(super) fn handle_prompt_response(
             || result.as_ref().err().is_some_and(|e| {
                 let status =
                     http_status.or_else(|| crate::app::error_display::parse_http_status(e));
-                is_credit_limit_error(status, e)
+                agent.session.grok_sole_provider && is_credit_limit_error(status, e)
             });
         // A 401/auth failure already showed an actionable `ReAuthRequired` prompt via the RetryState handler (which runs before this PromptResponse)
         // Suppress the redundant "Turn failed" block and error toast so only the prompt shows

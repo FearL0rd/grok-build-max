@@ -182,6 +182,7 @@ fn dispatch_load_session_ungated(
             models: app.models.clone(),
             state: AgentState::Idle,
             tracker: AcpUpdateTracker::new(),
+            grok_sole_provider: crate::app::dispatch::grok_is_sole_provider(),
             cwd: session_cwd.clone().unwrap_or_else(|| app.cwd.clone()),
             is_worktree: crate::app::session_startup::parent_session_is_worktree(
                 &session_id,
@@ -1088,6 +1089,7 @@ pub(in crate::app::dispatch) fn dispatch_load_session_with_restore(
             models: app.models.clone(),
             state: AgentState::Idle,
             tracker: AcpUpdateTracker::new(),
+            grok_sole_provider: crate::app::dispatch::grok_is_sole_provider(),
             cwd: app.cwd.clone(),
             is_worktree: crate::app::session_startup::parent_session_is_worktree(
                 &session_id,

@@ -269,6 +269,7 @@ fn build_fork_placeholder(
             models: app.models.clone(),
             state: AgentState::Idle,
             tracker: AcpUpdateTracker::new(),
+            grok_sole_provider: crate::app::dispatch::grok_is_sole_provider(),
             cwd: parent_cwd.to_path_buf(),
             is_worktree: false,
             forked_from: Some(parent_id),

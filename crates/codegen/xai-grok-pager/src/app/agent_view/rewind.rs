@@ -203,6 +203,7 @@ mod sync_rewind_anchor_to_picker_tests {
                 rate_limited: false,
                 model_incompatible: false,
                 credit_limit_blocked: false,
+                grok_sole_provider: true,
                 free_usage_blocked: false,
                 available_commands: Vec::new(),
                 available_commands_generation: 0,

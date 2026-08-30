@@ -778,6 +778,10 @@ pub(super) fn handle_providers_done(
     // (the error still surfaces as a toast).
     if let Err(e) = &result {
         agent.show_toast(e);
+    } else {
+        // Config write landed: re-derive the credit-upsell gate from the new
+        // `[failover].order` so the next turn applies it.
+        agent.session.grok_sole_provider = super::billing::grok_is_sole_provider();
     }
     let Some(ref mut modal) = agent.providers_modal else {
         return vec![];

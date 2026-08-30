@@ -1,5 +1,6 @@
 //! Tests for credit-limit upsells, paywall gating, and auto-topup.
 
+use super::super::billing::order_is_grok_only;
 use super::*;
 use xai_grok_shell::sampling::error::is_free_usage_exhausted_error;
 
@@ -340,6 +341,23 @@ fn is_credit_limit_error_matches_legacy_403_and_pool_402() {
         None,
         "usage balance exhausted without status"
     ));
+}
+
+#[test]
+fn sole_provider_gate_fires_only_for_grok_only_chain() {
+    // Empty order = nothing to roll over to = sole provider, upsell allowed.
+    assert!(order_is_grok_only(&[]));
+    assert!(order_is_grok_only(&["grok".to_string()]));
+    assert!(order_is_grok_only(&[
+        "Grok".to_string(),
+        "GROK".to_string()
+    ]));
+    // Any non-grok entry means rollover is possible, suppress the upsell.
+    assert!(!order_is_grok_only(&[
+        "grok".to_string(),
+        "anthropic".to_string()
+    ]));
+    assert!(!order_is_grok_only(&["openrouter".to_string()]));
 }
 
 #[test]
