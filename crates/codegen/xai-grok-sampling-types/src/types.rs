@@ -538,8 +538,13 @@ impl ToolCallFunction {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Usage {
+    // Some providers (e.g. NVIDIA) emit explicit `null` here; `default`
+    // alone only covers *missing* keys, not null.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub prompt_tokens: u32,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub completion_tokens: u32,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub total_tokens: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_tokens_details: Option<PromptTokensDetails>,
@@ -554,21 +559,23 @@ pub struct Usage {
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct PromptTokensDetails {
-    #[serde(default)]
+    // `null` → 0: NVIDIA sends explicit null for absent detail fields.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub cached_tokens: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub audio_tokens: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct CompletionTokensDetails {
-    #[serde(default)]
+    // `null` → 0: NVIDIA sends explicit null for absent detail fields.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub reasoning_tokens: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub audio_tokens: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub accepted_prediction_tokens: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub rejected_prediction_tokens: u32,
 }
 // ============ Streaming types ============
@@ -1489,6 +1496,65 @@ mod tests {
         assert_eq!(delta.role, Some(Role::Assistant));
         assert_eq!(delta.content, Some("".to_string()));
         assert!(delta.tool_calls.is_empty());
+    }
+
+    /// Regression: NVIDIA sends explicit `null` for absent usage fields and
+    /// detail entries. `#[serde(default)]` only covers *missing* keys, so a
+    /// bare `u32` with `default` still rejects `null` mid-stream and kills the
+    /// whole turn with a serialization error after minutes of output.
+    #[test]
+    fn test_usage_deserialize_with_null_fields() {
+        let usage_json = r#"{
+            "prompt_tokens": 1200,
+            "completion_tokens": 300,
+            "total_tokens": 1500,
+            "prompt_tokens_details": {"cached_tokens": null, "audio_tokens": null},
+            "completion_tokens_details": {
+                "reasoning_tokens": null,
+                "audio_tokens": null,
+                "accepted_prediction_tokens": null,
+                "rejected_prediction_tokens": null
+            }
+        }"#;
+
+        let usage =
+            serde_json::from_str::<Usage>(usage_json).expect("null usage fields must not fail");
+        assert_eq!(usage.prompt_tokens, 1200);
+        assert_eq!(usage.completion_tokens, 300);
+        assert_eq!(usage.total_tokens, 1500);
+        let details = usage.prompt_tokens_details.unwrap();
+        assert_eq!(details.cached_tokens, 0);
+        assert_eq!(details.audio_tokens, 0);
+        let cdetails = usage.completion_tokens_details.unwrap();
+        assert_eq!(cdetails.reasoning_tokens, 0);
+    }
+
+    /// Regression: the final chunk of an NVIDIA stream carries the full
+    /// `usage` object; it must round-trip through `ChatCompletionChunk` the
+    /// way the stream parser consumes it.
+    #[test]
+    fn test_chat_completion_chunk_usage_null_tolerant() {
+        let chunk_json = r#"{
+            "id": "chatcmpl-1",
+            "object": "chat.completion.chunk",
+            "created": 1700000000,
+            "model": "deepseek-v4-flash",
+            "choices": [{"index": 0, "delta": {"content": null}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": null,
+                "completion_tokens": 42,
+                "total_tokens": 2042,
+                "prompt_tokens_details": null,
+                "completion_tokens_details": null
+            }
+        }"#;
+
+        let chunk = serde_json::from_str::<ChatCompletionChunk>(chunk_json)
+            .expect("chunk with null usage fields must deserialize");
+        let usage = chunk.usage.expect("usage present");
+        assert_eq!(usage.prompt_tokens, 0);
+        assert_eq!(usage.completion_tokens, 42);
+        assert!(chunk.choices[0].delta.content.is_none());
     }
 
     /// Regression test: cloning `Box<dyn TraceContext>` must not infinitely recurse.
