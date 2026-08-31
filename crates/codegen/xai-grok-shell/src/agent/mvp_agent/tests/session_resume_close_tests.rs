@@ -731,3 +731,58 @@ fn disconnect_does_not_unload_a_session_mid_attach() {
         );
     });
 }
+/// Load/resume must arm rollover like `new_session` does: a resumed session
+/// whose actor was re-spawned would otherwise run on the grok default with an
+/// empty failover chain, and a fatal 402/401 surfaces raw instead of rolling
+/// over to `[failover].order`. The fake actor records the installed chain.
+#[test]
+fn a_load_seeds_the_failover_chain_on_the_resident_actor() {
+    super::run_local_for_bridge_test(|| async {
+        let mut agent = super::build_minimal_agent_for_tests();
+        let raw: toml::Value = toml::from_str(concat!(
+            "[failover]\n",
+            "order = [\"openai\", \"ghost\"]\n\n",
+            "[model.openai]\n",
+            "base_url = \"https://api.openai.com/v1\"\n",
+            "api_key = \"sk-test\"\n",
+            "model = \"gpt-5\"\n",
+        ))
+        .unwrap();
+        agent
+            .cfg
+            .replace(crate::agent::config::Config::new_from_toml_cfg(&raw).unwrap());
+        let sid = acp::SessionId::new("sess-load-seed");
+        let (handle, _tx, mut cmd_rx) = super::make_live_session_handle(&sid, None);
+        agent.insert_resident(&sid, handle);
+        let (chain_tx, mut chain_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::task::spawn_local(async move {
+            while let Some(cmd) = cmd_rx.recv().await {
+                match cmd {
+                    crate::session::SessionCommand::UpdateFailoverChain {
+                        chain,
+                        responds_to,
+                    } => {
+                        let names: Vec<String> =
+                            chain.iter().map(|(name, _)| name.clone()).collect();
+                        let _ = chain_tx.send(names);
+                        let _ = responds_to.send(());
+                    }
+                    crate::session::SessionCommand::IsBusy { respond_to } => {
+                        let _ = respond_to.send(false);
+                    }
+                    _ => {}
+                }
+            }
+        });
+        agent.seed_failover_chain(&sid).await;
+        let names = chain_rx
+            .recv()
+            .await
+            .expect("a load must install the failover chain on the actor");
+        assert_eq!(
+            names,
+            vec!["openai".to_string()],
+            "'ghost' has no [model.ghost] entry and must be skipped, not fatal"
+        );
+    });
+}

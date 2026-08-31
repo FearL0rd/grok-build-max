@@ -567,33 +567,7 @@ impl MvpAgent {
         }
         // Seed the provider failover chain from config.toml so rollover is
         // armed from the session's first prompt.
-        {
-            let session_key = self.auth_manager.current_or_expired().map(|a| a.key.clone());
-            let client_version = self
-                .client_version()
-                .unwrap_or_else(|| "grok-build".to_owned());
-            let (chain, warnings) = {
-                let cfg = self.cfg.borrow();
-                crate::util::providers::build_failover_chain(
-                    &cfg,
-                    session_key.as_deref(),
-                    &client_version,
-                )
-            };
-            for warning in &warnings {
-                tracing::warn!(session_id = %session_id.0, "failover chain: {warning}");
-            }
-            if !chain.is_empty()
-                && let Some(handle) = self.session_handle_waiting_for_load(&session_id).await
-            {
-                let (responds_to, rx) = tokio::sync::oneshot::channel();
-                let _ = handle.cmd_tx.send(SessionCommand::UpdateFailoverChain {
-                    chain,
-                    responds_to,
-                });
-                let _ = rx.await;
-            }
-        }
+        self.seed_failover_chain(&session_id).await;
         self.maybe_spawn_interactive_trust_prompt(
             &session_id,
             cwd.as_path(),
@@ -1051,6 +1025,11 @@ impl MvpAgent {
             });
             false
         };
+        // Load/resume must arm rollover too: a resumed session whose actor
+        // was re-spawned (or a reconnect) would otherwise run the whole
+        // session on the grok default with an empty failover chain, and a
+        // fatal error (402, auth) surfaces raw instead of rolling over.
+        self.seed_failover_chain(&session_id).await;
         {
             let init_meta = self
                 .initialize_request
@@ -1130,6 +1109,37 @@ impl MvpAgent {
             restored_from_disk,
         );
         Ok(response)
+    }
+    /// Build the provider failover chain from config.toml and install it on
+    /// the session's sampler. Called from `new_session` and `attach_session`
+    /// (load/resume) so rollover is armed even when the actor was re-spawned
+    /// for a resumed session; a reconnect re-install is idempotent.
+    pub(super) async fn seed_failover_chain(&self, session_id: &acp::SessionId) {
+        let session_key = self.auth_manager.current_or_expired().map(|a| a.key.clone());
+        let client_version = self
+            .client_version()
+            .unwrap_or_else(|| "grok-build".to_owned());
+        let (chain, warnings) = {
+            let cfg = self.cfg.borrow();
+            crate::util::providers::build_failover_chain(
+                &cfg,
+                session_key.as_deref(),
+                &client_version,
+            )
+        };
+        for warning in &warnings {
+            tracing::warn!(session_id = %session_id.0, "failover chain: {warning}");
+        }
+        if !chain.is_empty()
+            && let Some(handle) = self.session_handle_waiting_for_load(session_id).await
+        {
+            let (responds_to, rx) = tokio::sync::oneshot::channel();
+            let _ = handle.cmd_tx.send(SessionCommand::UpdateFailoverChain {
+                chain,
+                responds_to,
+            });
+            let _ = rx.await;
+        }
     }
     /// Restore-code phase: check the persisted HEAD out into `cwd`, then
     /// worktree nor the session's own, so it cannot detach a real checkout.
