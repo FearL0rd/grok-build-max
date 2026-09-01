@@ -159,6 +159,9 @@ impl SamplerActor {
             SamplerCommand::ActiveCount { reply } => {
                 let _ = reply.send(self.state.active_requests.len());
             }
+            SamplerCommand::PollChain { reply } => {
+                let _ = reply.send(self.state.failover_chain.clone());
+            }
         }
     }
 }

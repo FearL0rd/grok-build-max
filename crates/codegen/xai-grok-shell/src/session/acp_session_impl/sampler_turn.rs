@@ -682,14 +682,33 @@ impl SessionActor {
             });
         let creds = self.chat_state_handle.get_credentials().await;
         let model_facts = self.model_auth_facts(cfg.model.as_str());
+        // When the session has rolled over to a failover provider, the
+        // chat-state `cfg` carries the winner's API `model` id but not its
+        // endpoint/auth identity (the rollover event stamps only `model`).
+        // Adopt the chain entry for that model here so sidecar clients
+        // (auto-compact, goal, laziness, recap, ...) hit the winner's
+        // base_url with its own api_key instead of the session's origin
+        // endpoint with a mismatched model → 401 "authentication problem".
+        let chain_entry = self
+            .sampler_handle
+            .poll_chain()
+            .await
+            .into_iter()
+            .find(|(_, sc)| sc.model == cfg.model);
+        let chain_entry = chain_entry.as_ref();
         // Gate on the stable session classifier, not `creds.auth_type` — see
         // `crate::agent::auth_method::session_token_auth_gate`. `cfg.base_url`
         // keeps an `Unknown` BYOK status refreshable against first-party xAI
         // hosts without leaking the session token to a third-party endpoint.
+        // A chain entry overrides the origin endpoint, so its auth must come
+        // from the chain entry's own api_key, never the session token.
         let auth_method = self.auth_method_id.load();
-        let gate =
-            SessionTokenAuthGate::new(auth_method.as_deref(), model_facts.byok, &cfg.base_url);
-        let use_bearer_resolver = gate.active();
+        let gate = SessionTokenAuthGate::new(
+            auth_method.as_deref(),
+            model_facts.byok,
+            &cfg.base_url,
+        );
+        let use_bearer_resolver = gate.active() && chain_entry.is_none();
         self.log_auth_gate_unknown("reconstruct_full_config", gate, &cfg.base_url);
         // Refresh the session token before the sampler reads it; gated to sessions that use it.
         if use_bearer_resolver && let Some(am) = self.auth_manager.as_ref() {
@@ -697,22 +716,42 @@ impl SessionActor {
         }
         // Session path: only seed a wire-valid AT. Hard-expired keys must not
         // land in default headers when the resolver has nothing to stamp.
-        let api_key = if use_bearer_resolver {
-            // `use_bearer_resolver` means the endpoint is a first-party xAI URL.
-            // A session from another authority must not seed the default headers either.
-            self.auth_manager
-                .as_ref()
-                .filter(|_| ActiveAuthBackend::default().is_xai_authority())
-                .and_then(|am| am.current_wire_valid().map(|a| a.key))
-        } else {
-            creds.api_key
-        };
-        let auth_scheme = model_facts.auth_scheme;
-        let mut extra_headers = cfg.extra_headers;
+        let (api_key, effective_base_url, effective_backend, auth_scheme, keyless, chain_headers) =
+            match chain_entry {
+                Some((_, chain_sc)) => (
+                    chain_sc.api_key.clone(),
+                    chain_sc.base_url.clone(),
+                    chain_sc.api_backend.clone(),
+                    chain_sc.auth_scheme,
+                    chain_sc.keyless,
+                    chain_sc.extra_headers.clone(),
+                ),
+                None => {
+                    let api_key = if use_bearer_resolver {
+                        // `use_bearer_resolver` means the endpoint is a first-party xAI URL.
+                        // A session from another authority must not seed the default headers either.
+                        self.auth_manager
+                            .as_ref()
+                            .filter(|_| ActiveAuthBackend::default().is_xai_authority())
+                            .and_then(|am| am.current_wire_valid().map(|a| a.key))
+                    } else {
+                        creds.api_key
+                    };
+                    (
+                        api_key,
+                        cfg.base_url.clone(),
+                        cfg.api_backend.clone(),
+                        model_facts.auth_scheme,
+                        false,
+                        cfg.extra_headers.clone(),
+                    )
+                }
+            };
+        let mut extra_headers = chain_headers;
         crate::agent::config::inject_url_derived_headers(
             &mut extra_headers,
             creds.alpha_test_key.as_deref(),
-            &cfg.base_url,
+            &effective_base_url,
         );
         let compaction_at_tokens = self.compaction_at_tokens.get();
         let compactions_remaining = self.compactions_remaining.get();
@@ -741,18 +780,18 @@ impl SessionActor {
         }
         let extra_response_includes = crate::agent::config::response_include_extensions(
             self.supports_backend_search.get(),
-            &cfg.api_backend,
-            &cfg.base_url,
+            &effective_backend,
+            &effective_base_url,
         );
         SamplingConfig {
             api_key,
-            keyless: false,
-            base_url: cfg.base_url,
+            keyless,
+            base_url: effective_base_url,
             model: cfg.model,
             max_completion_tokens: cfg.max_completion_tokens,
             temperature: cfg.temperature,
             top_p: cfg.top_p,
-            api_backend: cfg.api_backend,
+            api_backend: effective_backend,
             auth_scheme,
             extra_headers,
             extra_response_includes,

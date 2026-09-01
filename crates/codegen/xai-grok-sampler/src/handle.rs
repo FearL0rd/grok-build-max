@@ -130,6 +130,18 @@ impl SamplerHandle {
         reply_rx.await.unwrap_or(0)
     }
 
+    /// Query the currently installed failover chain. Empty when no chain
+    /// has been installed (or the actor is shut down). Gives shell-side
+    /// sidecar clients (`reconstruct_full_config`, compaction, goal, ...)
+    /// the same per-provider endpoint identity the actor walks.
+    pub async fn poll_chain(&self) -> crate::FailoverChain {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self
+            .cmd_tx
+            .send(SamplerCommand::PollChain { reply: reply_tx });
+        reply_rx.await.unwrap_or_default()
+    }
+
     /// Submit a request and await its completion. Events still flow
     /// to the shared channel for live UI updates -- this method just
     /// additionally awaits the per-request completion oneshot so the

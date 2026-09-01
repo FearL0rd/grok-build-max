@@ -46,4 +46,7 @@ pub(crate) enum SamplerCommand {
 
     /// Query: how many requests are in flight?
     ActiveCount { reply: oneshot::Sender<usize> },
+
+    /// Query: the currently installed failover chain (empty when none is set).
+    PollChain { reply: oneshot::Sender<crate::FailoverChain> },
 }

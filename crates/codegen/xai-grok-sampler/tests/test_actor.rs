@@ -1804,3 +1804,37 @@ async fn chain_entry_without_api_key_is_skipped() {
     );
     server.shutdown();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn poll_chain_returns_installed_chain() {
+    let chain = vec![
+        ("a".to_string(), test_config("http://127.0.0.1:9/v1".to_string(), "ma")),
+        ("b".to_string(), test_config("http://127.0.0.1:9/v1".to_string(), "mb")),
+    ];
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let handle = SamplerActor::spawn(
+        test_config("http://127.0.0.1:9/v1".to_string(), "seed"),
+        RetryPolicy::default(),
+        event_tx,
+    );
+    handle.update_chain(chain.clone());
+    let polled = handle.poll_chain().await;
+    assert_eq!(polled.len(), chain.len());
+    for ((name, sc), (want_name, want_sc)) in polled.iter().zip(chain.iter()) {
+        assert_eq!(name, want_name);
+        assert_eq!(sc.model, want_sc.model);
+        assert_eq!(sc.base_url, want_sc.base_url);
+        assert_eq!(sc.api_key, want_sc.api_key);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn poll_chain_is_empty_before_install() {
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let handle = SamplerActor::spawn(
+        test_config("http://127.0.0.1:9/v1".to_string(), "seed"),
+        RetryPolicy::default(),
+        event_tx,
+    );
+    assert!(handle.poll_chain().await.is_empty());
+}
