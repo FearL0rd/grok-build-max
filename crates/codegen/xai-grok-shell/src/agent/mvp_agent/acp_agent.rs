@@ -1285,6 +1285,12 @@ impl acp::Agent for MvpAgent {
             .as_ref()
             .map(|ctx| ctx.artifact_upload_context());
         let traceparent = xai_file_utils::trace_context::current_traceparent();
+        // Self-heal: the chain install at load/resume can be lost, which
+        // silently disables rollover and leaves sidecars on the default
+        // endpoint. Re-seed before every turn; idempotent, and FIFO command
+        // ordering guarantees the install lands before the prompt itself.
+        self.seed_failover_chain(&arguments.session_id, false)
+            .await;
         let dispatch_result: Result<(), acp::Error> = if send_now {
             handle
                 .cmd_tx

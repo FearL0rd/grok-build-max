@@ -774,7 +774,7 @@ fn a_load_seeds_the_failover_chain_on_the_resident_actor() {
                 }
             }
         });
-        agent.seed_failover_chain(&sid).await;
+        agent.seed_failover_chain(&sid, true).await;
         let names = chain_rx
             .recv()
             .await
@@ -784,5 +784,59 @@ fn a_load_seeds_the_failover_chain_on_the_resident_actor() {
             vec!["openai".to_string()],
             "'ghost' has no [model.ghost] entry and must be skipped, not fatal"
         );
+    });
+}
+
+/// The prompt-path re-seed uses `await_install=false` so a busy session's
+/// run loop is never blocked, but the install must still land: FIFO command
+/// ordering puts the chain update ahead of the prompt itself.
+#[test]
+fn a_prompt_path_reseed_installs_the_chain_without_awaiting() {
+    super::run_local_for_bridge_test(|| async {
+        let mut agent = super::build_minimal_agent_for_tests();
+        let raw: toml::Value = toml::from_str(concat!(
+            "[failover]\n",
+            "order = [\"openai\"]\n\n",
+            "[model.openai]\n",
+            "base_url = \"https://api.openai.com/v1\"\n",
+            "api_key = \"sk-test\"\n",
+            "model = \"gpt-5\"\n",
+        ))
+        .unwrap();
+        agent
+            .cfg
+            .replace(crate::agent::config::Config::new_from_toml_cfg(&raw).unwrap());
+        let sid = acp::SessionId::new("sess-prompt-reseed");
+        let (handle, _tx, mut cmd_rx) = super::make_live_session_handle(&sid, None);
+        agent.insert_resident(&sid, handle);
+        let (chain_tx, mut chain_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::task::spawn_local(async move {
+            while let Some(cmd) = cmd_rx.recv().await {
+                if let crate::session::SessionCommand::UpdateFailoverChain {
+                    chain,
+                    responds_to,
+                } = cmd
+                {
+                    let names: Vec<String> =
+                        chain.iter().map(|(name, _)| name.clone()).collect();
+                    let _ = chain_tx.send(names);
+                    let _ = responds_to.send(());
+                }
+            }
+        });
+        agent.seed_failover_chain(&sid, false).await;
+        // Give the spawned loop a chance to drain; the reply is ignored on
+        // this path, so poll rather than block on rx.
+        for _ in 0..50 {
+            if !chain_rx.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let names = chain_rx
+            .recv()
+            .await
+            .expect("a prompt-path reseed must still install the failover chain");
+        assert_eq!(names, vec!["openai".to_string()]);
     });
 }

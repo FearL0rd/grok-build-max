@@ -689,8 +689,11 @@ impl SessionActor {
         // user's original selection because every submit re-walks the chain
         // from the top — the reconstruction below swaps in the served
         // entry's model id so sidecars do not send a model the serving
-        // endpoint does not know. Prefer the served entry; fall back to the
-        // original selection when no serve has been reported yet.
+        // endpoint does not know. Prefer the served entry, then a chain
+        // entry matching the original selection; on a fresh resume (no serve
+        // reported yet, selection not in the chain) fall back to the chain
+        // head so sidecars follow the same first provider the main turn's
+        // walk will use, instead of the dead default endpoint.
         let served = self.served_provider.lock().clone();
         let chain = self.sampler_handle.poll_chain().await;
         let chain_entry = served
@@ -701,6 +704,7 @@ impl SessionActor {
                     .find(|(n, sc)| n.as_str() == name.as_str() && sc.model == model.as_str())
             })
             .or_else(|| chain.iter().find(|(_, sc)| sc.model == cfg.model))
+            .or_else(|| chain.first())
             .cloned();
         let chain_entry = chain_entry.as_ref();
         // Gate on the stable session classifier, not `creds.auth_type` — see

@@ -567,7 +567,7 @@ impl MvpAgent {
         }
         // Seed the provider failover chain from config.toml so rollover is
         // armed from the session's first prompt.
-        self.seed_failover_chain(&session_id).await;
+        self.seed_failover_chain(&session_id, true).await;
         self.maybe_spawn_interactive_trust_prompt(
             &session_id,
             cwd.as_path(),
@@ -1029,7 +1029,7 @@ impl MvpAgent {
         // was re-spawned (or a reconnect) would otherwise run the whole
         // session on the grok default with an empty failover chain, and a
         // fatal error (402, auth) surfaces raw instead of rolling over.
-        self.seed_failover_chain(&session_id).await;
+        self.seed_failover_chain(&session_id, true).await;
         {
             let init_meta = self
                 .initialize_request
@@ -1111,10 +1111,17 @@ impl MvpAgent {
         Ok(response)
     }
     /// Build the provider failover chain from config.toml and install it on
-    /// the session's sampler. Called from `new_session` and `attach_session`
-    /// (load/resume) so rollover is armed even when the actor was re-spawned
-    /// for a resumed session; a reconnect re-install is idempotent.
-    pub(super) async fn seed_failover_chain(&self, session_id: &acp::SessionId) {
+    /// the session's sampler. Called from `new_session`, `attach_session`
+    /// (load/resume) and `prompt` so rollover is armed even when the actor
+    /// was re-spawned for a resumed session; a reconnect re-install is
+    /// idempotent. `await_install=false` (prompt path) skips waiting for the
+    /// install reply so a busy session's run loop is never blocked — FIFO
+    /// command ordering still guarantees the chain lands before the turn.
+    pub(super) async fn seed_failover_chain(
+        &self,
+        session_id: &acp::SessionId,
+        await_install: bool,
+    ) {
         let session_key = self.auth_manager.current_or_expired().map(|a| a.key.clone());
         let client_version = self
             .client_version()
@@ -1138,7 +1145,9 @@ impl MvpAgent {
                 chain,
                 responds_to,
             });
-            let _ = rx.await;
+            if await_install {
+                let _ = rx.await;
+            }
         }
     }
     /// Restore-code phase: check the persisted HEAD out into `cwd`, then
