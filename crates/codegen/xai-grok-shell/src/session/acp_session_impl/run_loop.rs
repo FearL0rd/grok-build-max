@@ -709,6 +709,9 @@ pub(super) async fn run_session(
                             let _ = responds_to.send(());
                         }
                         SessionCommand::SetSessionModel { sampling_config, use_concise, is_family_switch, apply_prompt_override, skip_prompt_rewrite, auto_compact_threshold_percent, responds_to } => {
+                            // Explicit model switch: the failover winner no
+                            // longer reflects the user's choice.
+                            *session.served_provider.lock() = None;
                             let updated_model_id = session.handle_set_session_model(sampling_config, use_concise, is_family_switch, apply_prompt_override, skip_prompt_rewrite, auto_compact_threshold_percent).await;
                             let _ = responds_to.send(updated_model_id);
                         }
@@ -727,6 +730,9 @@ pub(super) async fn run_session(
                             let _ = responds_to.send(outcome);
                         }
                         SessionCommand::OverrideModelName { model_name, extra_headers, context_window } => {
+                            // Explicit model override: the failover winner no
+                            // longer reflects the user's choice.
+                            *session.served_provider.lock() = None;
                             // Update the actor's SamplingConfig model + headers + context window.
                             if let Some(mut cfg) = session.chat_state_handle.get_sampling_config().await {
                                 tracing::info!(

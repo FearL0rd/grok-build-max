@@ -1672,6 +1672,58 @@ async fn chain_rollover_restamps_provider_model_name() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chain_emits_provider_served_before_completed() {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            let events = sse::chat_completion_events("saved", "test-model");
+            Sse::new(stream::iter(
+                events.into_iter().map(Ok::<_, std::convert::Infallible>),
+            ))
+        }),
+    );
+    let server = MockServer::spawn(app).await;
+    let chain = vec![(
+        "alive".to_string(),
+        test_config(server.base_url(), "am"),
+    )];
+
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let handle = SamplerActor::spawn(
+        test_config(server.base_url(), "seed"),
+        RetryPolicy::default(),
+        event_tx,
+    );
+    handle.update_chain(chain);
+    handle.submit(RequestId::from("chain-served"), user_request("hello"));
+
+    let mut served: Option<(String, String)> = None;
+    let terminal = loop {
+        let ev = tokio::time::timeout(Duration::from_secs(10), event_rx.recv())
+            .await
+            .expect("timed out")
+            .expect("channel closed");
+        match ev {
+            SamplingEvent::ProviderServed { name, model, .. } => {
+                served = Some((name.to_string(), model.to_string()));
+            }
+            SamplingEvent::Completed { .. } => break,
+            SamplingEvent::Failed { .. } | SamplingEvent::ProviderFailed { .. } => {
+                panic!("unexpected terminal failure: {ev:?}")
+            }
+            _ => {}
+        }
+    };
+    let _ = terminal;
+    assert_eq!(
+        served,
+        Some(("alive".to_string(), "am".to_string())),
+        "ProviderServed must precede Completed with the serving provider/model"
+    );
+    server.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chain_does_not_roll_over_after_partial_output() {
     // First provider streams one valid chunk (output observed), then a
     // malformed SSE data event => Serialization error mid-stream, AFTER

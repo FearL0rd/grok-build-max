@@ -1455,12 +1455,12 @@ async fn reasoning_only_doomloop_turn_captures_every_generation_as_segments() {
         .await;
 }
 
-/// After a rollover the session must stamp the winner's API model id onto
-/// `sampling_config.model`. The next sampler submit (after a tool-permission
-/// wait rebuilds the request from that config) then starts at the rolled-to
-/// chain entry instead of grok.
+/// After a rollover the session must NOT stamp the winner's API model id onto
+/// `sampling_config.model`: every submit re-walks the chain from the top so a
+/// recovered provider is picked up immediately. The winner is tracked in
+/// `served_provider` instead (sidecar reconstruction + display).
 #[tokio::test(flavor = "current_thread")]
-async fn provider_rollover_stamps_winner_model_into_sampling_config() {
+async fn provider_rollover_tracks_winner_without_stamping_sampling_config() {
     use xai_grok_sampler::{RequestId, SamplingEvent};
     let local = tokio::task::LocalSet::new();
     local
@@ -1490,13 +1490,6 @@ async fn provider_rollover_stamps_winner_model_into_sampling_config() {
             );
             let actor = Arc::new(fixture.actor);
 
-            let before = actor
-                .chat_state_handle
-                .get_sampling_config()
-                .await
-                .expect("chat-state actor alive");
-            assert_eq!(before.model, "grok-4");
-
             let req = RequestId::random();
             own_request(&actor, &req);
             actor
@@ -1515,9 +1508,41 @@ async fn provider_rollover_stamps_winner_model_into_sampling_config() {
                 .await
                 .expect("chat-state actor alive");
             assert_eq!(
-                after.model, "claude-sonnet-4",
-                "rollover must persist the winner's API model id so the next \
-                 sampler submit after a pause starts at that chain entry"
+                after.model, "grok-4",
+                "rollover must leave the user's selected model in place so the \
+                 next submit re-walks the chain from the top"
+            );
+            assert_eq!(
+                actor.served_provider.lock().clone(),
+                Some(("anthropic".to_string(), "claude-sonnet-4".to_string())),
+                "rollover must record the winner for sidecar reconstruction + display"
+            );
+        })
+        .await;
+}
+
+/// `ProviderServed` (single-entry synthetic name "provider") must not touch
+/// `served_provider` — no failover, nothing to track.
+#[tokio::test(flavor = "current_thread")]
+async fn provider_served_synthetic_name_is_ignored() {
+    use xai_grok_sampler::{RequestId, SamplingEvent};
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let fixture = make_replay_send_update_fixture().await;
+            let actor = Arc::new(fixture.actor);
+            let req = RequestId::random();
+            own_request(&actor, &req);
+            actor
+                .handle_sampling_event(SamplingEvent::ProviderServed {
+                    request_id: req,
+                    name: std::sync::Arc::from("provider"),
+                    model: std::sync::Arc::from("grok-4"),
+                })
+                .await;
+            assert!(
+                actor.served_provider.lock().is_none(),
+                "synthetic single-entry serves must not set the serving label"
             );
         })
         .await;

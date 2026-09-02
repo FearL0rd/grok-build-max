@@ -202,6 +202,17 @@ pub enum SamplingEvent {
         reason: String,
     },
 
+    /// A chain entry (or the synthetic single entry) finished a request
+    /// successfully. Lets the session display the provider/model that
+    /// actually served the turn. Emitted immediately before `Completed`.
+    ProviderServed {
+        request_id: RequestId,
+        /// Config name of the provider that served the request.
+        name: std::sync::Arc<str>,
+        /// API model id that served the request (`SamplerConfig.model`).
+        model: std::sync::Arc<str>,
+    },
+
     /// Every entry in the failover chain failed; nothing was attempted
     /// successfully. Terminal for the request.
     ProviderFailed {
@@ -230,6 +241,7 @@ impl SamplingEvent {
             | Self::BackendToolCallCompleted { request_id, .. }
             | Self::ProviderSkipped { request_id, .. }
             | Self::ProviderRolledOver { request_id, .. }
+            | Self::ProviderServed { request_id, .. }
             | Self::ProviderFailed { request_id, .. } => request_id,
         }
     }

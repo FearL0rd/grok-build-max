@@ -1252,6 +1252,12 @@ pub(crate) struct SessionActor {
     /// tests and other constructor sites use `SamplerHandle::noop()`.
     /// All inference flows through this handle.
     pub(crate) sampler_handle: xai_grok_sampler::SamplerHandle,
+    /// Provider/model that served the most recent request: `(provider_name,
+    /// api_model)`. Tracked separately from `sampling_config.model` so the
+    /// failover chain restarts from the top on every submit while sidecar
+    /// reconstruction still targets the actual winner. `None` until a
+    /// provider serves, cleared when the user picks a different model.
+    pub(crate) served_provider: parking_lot::Mutex<Option<(String, String)>>,
     /// Turn-sampling gate: `None` is the main session (ungated), `Some` is the process
     /// tree's shared sampling semaphore. See `acquire_subagent_sampling_permit`.
     pub(crate) sampling_gate: Option<Arc<tokio::sync::Semaphore>>,

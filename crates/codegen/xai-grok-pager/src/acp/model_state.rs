@@ -51,6 +51,12 @@ pub struct ModelState {
     /// When set, `get_context_window()` returns this instead of reading from the current model's metadata.
     /// Used for subagent views where SubagentProgress reports the actual window size.
     context_window_override: Option<u64>,
+    /// Display override for the model actually serving requests (failover
+    /// rollover). When set, `current_model_name()` returns this instead of the
+    /// user-selected model, so the prompt info line shows who answered the
+    /// last turn. Cleared by `set_current` (explicit `/model` switch, create,
+    /// load).
+    display_override: Option<String>,
 }
 
 impl ModelState {
@@ -60,6 +66,9 @@ impl ModelState {
 
     /// Display name for the current model.
     pub fn current_model_name(&self) -> Option<String> {
+        if let Some(label) = &self.display_override {
+            return Some(label.clone());
+        }
         let current = self.current.as_ref()?;
         if let Some(model_info) = self.available.get(current) {
             Some(model_info.name.clone())
@@ -136,6 +145,15 @@ impl ModelState {
                 .get(&model_id)
                 .and_then(|info| parse_reasoning_effort_meta(info.meta.as_ref()))
         });
+        // The user explicitly chose a model; the failover serving label is
+        // stale until the next rollover/serve.
+        self.display_override = None;
+    }
+
+    /// Record the provider/model that actually served the last request
+    /// (failover rollover). Shown by the prompt info line until cleared.
+    pub fn set_display_override(&mut self, label: String) {
+        self.display_override = Some(label);
     }
 
     /// The reasoning-effort menu for the current model. An unset or unsupported model yields no menu.
@@ -276,6 +294,7 @@ impl From<Option<acp::SessionModelState>> for ModelState {
                     current: current_model,
                     reasoning_effort,
                     context_window_override: None,
+                    display_override: None,
                 }
             })
             .unwrap_or_default()

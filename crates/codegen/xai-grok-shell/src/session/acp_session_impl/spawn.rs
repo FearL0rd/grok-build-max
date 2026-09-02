@@ -1838,6 +1838,7 @@ pub(crate) async fn spawn_session_actor(
         pending_image_strip: parking_lot::Mutex::new(std::collections::HashMap::new()),
         image_strip_rewrite_barrier: ImageStripRewriteBarrier::new(),
         sampler_handle,
+        served_provider: parking_lot::Mutex::new(None),
         sampling_gate,
         rebuild_spec: rebuild_spec.clone(),
         image_description_model,

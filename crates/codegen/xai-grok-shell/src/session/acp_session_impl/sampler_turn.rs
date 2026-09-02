@@ -682,19 +682,24 @@ impl SessionActor {
             });
         let creds = self.chat_state_handle.get_credentials().await;
         let model_facts = self.model_auth_facts(cfg.model.as_str());
-        // When the session has rolled over to a failover provider, the
-        // chat-state `cfg` carries the winner's API `model` id but not its
-        // endpoint/auth identity (the rollover event stamps only `model`).
-        // Adopt the chain entry for that model here so sidecar clients
-        // (auto-compact, goal, laziness, recap, ...) hit the winner's
-        // base_url with its own api_key instead of the session's origin
-        // endpoint with a mismatched model → 401 "authentication problem".
-        let chain_entry = self
-            .sampler_handle
-            .poll_chain()
-            .await
-            .into_iter()
-            .find(|(_, sc)| sc.model == cfg.model);
+        // Sidecar clients (auto-compact, goal, laziness, recap, ...) need
+        // the endpoint/auth identity of whichever provider last served.
+        // `served_provider` records the winner (provider name + model) from
+        // the last turn; `sampling_config.model` stays at the user's
+        // original selection because every submit re-walks the chain from
+        // the top. Prefer the served entry; fall back to the original
+        // selection when no serve has been reported yet.
+        let served = self.served_provider.lock().clone();
+        let chain = self.sampler_handle.poll_chain().await;
+        let chain_entry = served
+            .as_ref()
+            .and_then(|(name, model)| {
+                chain
+                    .iter()
+                    .find(|(n, sc)| n.as_str() == name.as_str() && sc.model == model.as_str())
+            })
+            .or_else(|| chain.iter().find(|(_, sc)| sc.model == cfg.model))
+            .cloned();
         let chain_entry = chain_entry.as_ref();
         // Gate on the stable session classifier, not `creds.auth_type` — see
         // `crate::agent::auth_method::session_token_auth_gate`. `cfg.base_url`

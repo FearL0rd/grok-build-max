@@ -554,18 +554,45 @@ impl SessionActor {
                         "reason": crate::util::truncate(&reason, 300),
                     })),
                 );
-                // Stamp the winner's API model id so the next sampler submit
-                // (after a tool-permission wait rebuilds the request from
-                // sampling_config) starts at this chain entry, not grok.
-                if let Some(mut cfg) = self.chat_state_handle.get_sampling_config().await {
-                    cfg.model = to_model.to_string();
-                    self.chat_state_handle.update_sampling_config(cfg);
-                }
+                // Deliberately do NOT stamp `sampling_config.model` with
+                // `to_model`: the user wants every submit to re-walk the
+                // chain from the top so a recovered provider is picked up
+                // immediately. The winner is tracked in `served_provider`
+                // (for display + sidecar reconstruction) instead.
+                *self.served_provider.lock() =
+                    Some((to.to_string(), to_model.to_string()));
                 self.signals_handle().set_primary_model(to_model.as_ref());
                 self.send_xai_notification(XaiSessionUpdate::ProviderRolledOver {
                     from: from.to_string(),
                     to: to.to_string(),
                     reason: crate::util::truncate(&reason, 300).to_owned(),
+                })
+                .await;
+                self.send_xai_notification(XaiSessionUpdate::ActiveModelChanged {
+                    provider: to.to_string(),
+                    model: to_model.to_string(),
+                })
+                .await;
+            }
+            SamplingEvent::ProviderServed { name, model, .. } => {
+                // "provider" is the synthetic single-entry name for override
+                // / no-chain requests — no failover, nothing to track.
+                if name.as_ref() == "provider" {
+                    return;
+                }
+                *self.served_provider.lock() =
+                    Some((name.to_string(), model.to_string()));
+                xai_grok_telemetry::unified_log::info(
+                    "shell.turn.provider_served",
+                    Some(self.session_info.id.0.as_ref()),
+                    Some(serde_json::json!({
+                        "provider": name.as_ref(),
+                        "model": model.as_ref(),
+                    })),
+                );
+                self.send_xai_notification(XaiSessionUpdate::ActiveModelChanged {
+                    provider: name.to_string(),
+                    model: model.to_string(),
                 })
                 .await;
             }

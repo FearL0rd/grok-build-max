@@ -484,6 +484,14 @@ pub enum SessionUpdate {
         /// All provider names that were attempted, in order.
         providers: Vec<String>,
     },
+    /// The provider/model that actually served the latest request changed
+    /// (failover rollover, or a subsequent success after walking the chain).
+    ActiveModelChanged {
+        /// Provider config name now serving requests.
+        provider: String,
+        /// API model id now serving requests.
+        model: String,
+    },
     /// Auto-compact is starting due to context window threshold
     AutoCompactStarted {
         /// Current token usage

@@ -153,6 +153,8 @@ pub(crate) async fn run_chain_task(
             });
             continue;
         }
+        // Captured before `config` moves into the provider run.
+        let model: std::sync::Arc<str> = Arc::from(config.model.as_str());
         let outcome = run_one_provider(
             request_id.clone(),
             request.clone(),
@@ -165,6 +167,13 @@ pub(crate) async fn run_chain_task(
         .await;
         match outcome {
             EntryOutcome::Completed { response, metrics } => {
+                // Tell the session which provider/model actually served
+                // this request, before the terminal event.
+                let _ = event_tx.send(SamplingEvent::ProviderServed {
+                    request_id: request_id.clone(),
+                    name: Arc::from(name.as_str()),
+                    model: model.clone(),
+                });
                 // The inner run suppressed the L2 terminal event; emit it
                 // here now that the walk has settled on an answer.
                 let terminal_event_queued = event_tx

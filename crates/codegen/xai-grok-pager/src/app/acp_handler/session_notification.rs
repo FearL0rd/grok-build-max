@@ -310,7 +310,8 @@ pub(super) fn handle_session_notification_with_origin(
         | XaiSessionUpdate::MemorySessionSaved { .. }
         | XaiSessionUpdate::ProviderSkipped { .. }
         | XaiSessionUpdate::ProviderRolledOver { .. }
-        | XaiSessionUpdate::ProviderFailed { .. }) => {
+        | XaiSessionUpdate::ProviderFailed { .. }
+        | XaiSessionUpdate::ActiveModelChanged { .. }) => {
             let changed = apply_session_event(
                 update,
                 &mut agent.session,
@@ -1581,6 +1582,13 @@ pub(super) fn apply_session_event(
                 "✗ all providers failed: {}",
                 providers.join(", ")
             )));
+            true
+        }
+        XaiSessionUpdate::ActiveModelChanged { provider, model } => {
+            // Keep the prompt info line honest: show who actually served.
+            session
+                .models
+                .set_display_override(format!("{provider}: {model}"));
             true
         }
         _ => false,
