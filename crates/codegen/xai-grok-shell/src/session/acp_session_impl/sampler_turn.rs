@@ -683,12 +683,14 @@ impl SessionActor {
         let creds = self.chat_state_handle.get_credentials().await;
         let model_facts = self.model_auth_facts(cfg.model.as_str());
         // Sidecar clients (auto-compact, goal, laziness, recap, ...) need
-        // the endpoint/auth identity of whichever provider last served.
-        // `served_provider` records the winner (provider name + model) from
-        // the last turn; `sampling_config.model` stays at the user's
-        // original selection because every submit re-walks the chain from
-        // the top. Prefer the served entry; fall back to the original
-        // selection when no serve has been reported yet.
+        // the endpoint/auth/model identity of whichever provider last
+        // served. `served_provider` records the winner (provider name +
+        // model) from the last turn; `sampling_config.model` stays at the
+        // user's original selection because every submit re-walks the chain
+        // from the top — the reconstruction below swaps in the served
+        // entry's model id so sidecars do not send a model the serving
+        // endpoint does not know. Prefer the served entry; fall back to the
+        // original selection when no serve has been reported yet.
         let served = self.served_provider.lock().clone();
         let chain = self.sampler_handle.poll_chain().await;
         let chain_entry = served
@@ -721,37 +723,49 @@ impl SessionActor {
         }
         // Session path: only seed a wire-valid AT. Hard-expired keys must not
         // land in default headers when the resolver has nothing to stamp.
-        let (api_key, effective_base_url, effective_backend, auth_scheme, keyless, chain_headers) =
-            match chain_entry {
-                Some((_, chain_sc)) => (
-                    chain_sc.api_key.clone(),
-                    chain_sc.base_url.clone(),
-                    chain_sc.api_backend.clone(),
-                    chain_sc.auth_scheme,
-                    chain_sc.keyless,
-                    chain_sc.extra_headers.clone(),
-                ),
-                None => {
-                    let api_key = if use_bearer_resolver {
-                        // `use_bearer_resolver` means the endpoint is a first-party xAI URL.
-                        // A session from another authority must not seed the default headers either.
-                        self.auth_manager
-                            .as_ref()
-                            .filter(|_| ActiveAuthBackend::default().is_xai_authority())
-                            .and_then(|am| am.current_wire_valid().map(|a| a.key))
-                    } else {
-                        creds.api_key
-                    };
-                    (
-                        api_key,
-                        cfg.base_url.clone(),
-                        cfg.api_backend.clone(),
-                        model_facts.auth_scheme,
-                        false,
-                        cfg.extra_headers.clone(),
-                    )
-                }
-            };
+        let (
+            api_key,
+            effective_base_url,
+            effective_backend,
+            auth_scheme,
+            keyless,
+            chain_headers,
+            effective_model,
+        ) = match chain_entry {
+            Some((_, chain_sc)) => (
+                chain_sc.api_key.clone(),
+                chain_sc.base_url.clone(),
+                chain_sc.api_backend.clone(),
+                chain_sc.auth_scheme,
+                chain_sc.keyless,
+                chain_sc.extra_headers.clone(),
+                // Sidecars talk to the serving endpoint directly: they must
+                // send the serving model id, or the endpoint rejects the
+                // user's selection with "modelCode: does not exist".
+                chain_sc.model.clone(),
+            ),
+            None => {
+                let api_key = if use_bearer_resolver {
+                    // `use_bearer_resolver` means the endpoint is a first-party xAI URL.
+                    // A session from another authority must not seed the default headers either.
+                    self.auth_manager
+                        .as_ref()
+                        .filter(|_| ActiveAuthBackend::default().is_xai_authority())
+                        .and_then(|am| am.current_wire_valid().map(|a| a.key))
+                } else {
+                    creds.api_key
+                };
+                (
+                    api_key,
+                    cfg.base_url.clone(),
+                    cfg.api_backend.clone(),
+                    model_facts.auth_scheme,
+                    false,
+                    cfg.extra_headers.clone(),
+                    cfg.model.clone(),
+                )
+            }
+        };
         let mut extra_headers = chain_headers;
         crate::agent::config::inject_url_derived_headers(
             &mut extra_headers,
@@ -792,7 +806,7 @@ impl SessionActor {
             api_key,
             keyless,
             base_url: effective_base_url,
-            model: cfg.model,
+            model: effective_model,
             max_completion_tokens: cfg.max_completion_tokens,
             temperature: cfg.temperature,
             top_p: cfg.top_p,

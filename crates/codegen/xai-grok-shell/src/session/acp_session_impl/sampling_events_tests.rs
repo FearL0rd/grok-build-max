@@ -1547,3 +1547,111 @@ async fn provider_served_synthetic_name_is_ignored() {
         })
         .await;
 }
+
+/// After a serve, `reconstruct_full_config` must adopt the serving entry's
+/// model id along with its endpoint/auth — sidecars (auto-compact, goal,
+/// recap, ...) talk to the serving endpoint directly, and the user's
+/// selection does not exist there (400 "modelCode: does not exist").
+#[tokio::test(flavor = "current_thread")]
+async fn reconstruct_full_config_adopts_served_model_for_sidecars() {
+    use xai_grok_sampler::{RequestId, SamplingEvent};
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let mut fixture = make_replay_send_update_fixture().await;
+            let (chat_event_tx, _chat_event_rx) = tokio::sync::mpsc::unbounded_channel();
+            fixture.actor.chat_state_handle = xai_chat_state::ChatStateActor::spawn(
+                vec![],
+                xai_grok_sampling_types::SamplingConfig {
+                    base_url: "http://grok.test".to_string(),
+                    model: "grok-4".to_string(),
+                    max_completion_tokens: None,
+                    temperature: None,
+                    top_p: None,
+                    api_backend: Default::default(),
+                    extra_headers: Default::default(),
+                    query_params: Default::default(),
+                    env_http_headers: Default::default(),
+                    context_window: std::num::NonZeroU64::new(128_000)
+                        .expect("test context_window must be non-zero"),
+                    reasoning_effort: None,
+                    stream_tool_calls: None,
+                },
+                Box::new(xai_chat_state::NullChatPersistence),
+                chat_event_tx,
+                tokio_util::sync::CancellationToken::new(),
+            );
+
+            let chain_base = xai_grok_sampler::SamplerConfig {
+                api_key: Some("grok-key".to_string()),
+                keyless: false,
+                base_url: "http://grok.test".to_string(),
+                model: "grok-4".to_string(),
+                max_completion_tokens: None,
+                temperature: None,
+                top_p: None,
+                api_backend: Default::default(),
+                auth_scheme: Default::default(),
+                extra_headers: Default::default(),
+                extra_response_includes: Vec::new(),
+                query_params: Default::default(),
+                env_http_headers: Default::default(),
+                context_window: 128_000,
+                client_version: None,
+                force_http1: false,
+                max_retries: Some(0),
+                stream_tool_calls: false,
+                idle_timeout_secs: None,
+                client_identifier: None,
+                reasoning_effort: None,
+                deployment_id: None,
+                user_id: None,
+                origin_client: None,
+                attribution_callback: None,
+                bearer_resolver: None,
+                supports_backend_search: false,
+                compactions_remaining: None,
+                compaction_at_tokens: None,
+                doom_loop_recovery: None,
+                header_injector: None,
+            };
+            let mut chain_winner = chain_base.clone();
+            chain_winner.model = "claude-sonnet-4".to_string();
+            chain_winner.base_url = "http://anthropic.test".to_string();
+            let (sampler_event_tx, _sampler_event_rx) = tokio::sync::mpsc::unbounded_channel::<
+                xai_grok_sampler::SamplingEvent,
+            >();
+            let sampler_handle = xai_grok_sampler::SamplerActor::spawn(
+                chain_base.clone(),
+                xai_grok_sampler::RetryPolicy::default(),
+                sampler_event_tx,
+            );
+            sampler_handle.update_chain(vec![
+                ("grok".to_string(), chain_base),
+                ("anthropic".to_string(), chain_winner),
+            ]);
+            fixture.actor.sampler_handle = sampler_handle;
+            let actor = Arc::new(fixture.actor);
+
+            let req = RequestId::random();
+            own_request(&actor, &req);
+            actor
+                .handle_sampling_event(SamplingEvent::ProviderServed {
+                    request_id: req,
+                    name: std::sync::Arc::from("anthropic"),
+                    model: std::sync::Arc::from("claude-sonnet-4"),
+                })
+                .await;
+
+            let sidecar = actor.reconstruct_full_config().await;
+            assert_eq!(
+                sidecar.model, "claude-sonnet-4",
+                "sidecar config must carry the serving model id, not the user's selection"
+            );
+            assert_eq!(
+                sidecar.base_url, "http://anthropic.test",
+                "sidecar config must carry the serving endpoint"
+            );
+        })
+        .await;
+}
