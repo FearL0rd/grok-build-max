@@ -2,9 +2,7 @@
 
 <h1>
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://media.x.ai/v1/website/spacexai-symbol-white-transparent-0c31957f.png">
-    <source media="(prefers-color-scheme: light)" srcset="https://media.x.ai/v1/website/spacexai-symbol-black-transparent-6435cf42.png">
-    <img alt="SpaceXAI logo" src="https://media.x.ai/v1/website/spacexai-symbol-black-transparent-6435cf42.png" width="96">
+    <img width="128" height="128" alt="image" src="https://github.com/user-attachments/assets/ba362505-1f11-4fb7-a3ed-b300683da91e">
   </picture>
   <br>
   Grok Build Max (<code>grokmax</code>)
