@@ -195,10 +195,9 @@ pub fn usage_warning_for_session(
 
         let pct = balance.effective_usage_pct;
         if pct > 90.0 {
-            // "Left" is the complement of floored usage, so it agrees with the floored summary: 99.994% shows "1% left", not "0%"
-            let remaining = (100 - pct.floor() as i64).max(0);
-            let label = balance.usage_label();
-            return Some((format!("{label} left: {remaining}%"), pct > 95.0));
+            // This slot sits in front of the status-bar model name; label it
+            // with what it actually annotates instead of billing percentage.
+            return Some(("Active Model".to_string(), pct > 95.0));
         }
         return None;
     };
@@ -436,11 +435,11 @@ mod tests {
     }
 
     #[test]
-    fn warning_uses_period_label() {
+    fn warning_slot_is_annotated_as_active_model() {
         let weekly = bal_period(92.0, "USAGE_PERIOD_TYPE_WEEKLY");
         assert_eq!(
             usage_warning(&weekly, None, true),
-            Some(("Weekly limit left: 8%".to_string(), false))
+            Some(("Active Model".to_string(), false))
         );
     }
 
@@ -455,18 +454,16 @@ mod tests {
     }
 
     #[test]
-    fn warning_percent_left_is_floor_complement() {
-        // 99.994% used floors to 99%, so it shows "1% left" (not "0% left"), and the warning and the floored summary always sum to 100
+    fn warning_critical_above_95_percent() {
         let almost = bal_period(99.994, "USAGE_PERIOD_TYPE_WEEKLY");
         assert_eq!(
             usage_warning(&almost, None, true),
-            Some(("Weekly limit left: 1%".to_string(), true))
+            Some(("Active Model".to_string(), true))
         );
-        // A true 100% (no credits) shows "0% left"
         let full = bal_period(100.0, "USAGE_PERIOD_TYPE_WEEKLY");
         assert_eq!(
             usage_warning(&full, None, true),
-            Some(("Weekly limit left: 0%".to_string(), true))
+            Some(("Active Model".to_string(), true))
         );
     }
 
@@ -477,11 +474,11 @@ mod tests {
         assert_eq!(usage_warning(&bal(50.0), None, true), None);
         assert_eq!(
             usage_warning(&bal(92.0), None, true),
-            Some(("Usage left: 8%".to_string(), false))
+            Some(("Active Model".to_string(), false))
         );
         assert_eq!(
             usage_warning(&bal(97.0), None, true),
-            Some(("Usage left: 3%".to_string(), true))
+            Some(("Active Model".to_string(), true))
         );
     }
 
@@ -622,7 +619,7 @@ mod tests {
         };
         assert_eq!(
             usage_warning(&zero, None, true),
-            Some(("Usage left: 1%".to_string(), true))
+            Some(("Active Model".to_string(), true))
         );
     }
 
