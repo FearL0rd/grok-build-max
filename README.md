@@ -28,6 +28,8 @@
 
 <img width="1067" height="447" alt="image" src="https://github.com/user-attachments/assets/45e87bd9-6323-402f-a91d-af727430b8f4" />
 
+<img width="853" height="260" alt="image" src="https://github.com/user-attachments/assets/b442bab7-ef7e-4e72-8663-9889f7dcadb1" />
+
 
 **Grok Build** is SpaceXAI's terminal-based AI coding agent. It runs as a
 full-screen TUI that understands your codebase, edits files, executes shell
