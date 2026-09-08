@@ -1519,6 +1519,8 @@ impl LocalTerminalActor {
         }
     }
 
+    // `task_ids` is consumed only by the unix persistent-shell block below.
+    #[cfg_attr(not(unix), allow(unused_variables))]
     async fn collect_shell_state_dumps(&mut self, task_ids: &[String]) {
         #[cfg(unix)]
         if self.persistent_shell {
