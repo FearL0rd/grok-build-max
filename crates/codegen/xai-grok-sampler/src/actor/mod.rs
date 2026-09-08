@@ -119,7 +119,8 @@ impl SamplerActor {
                 // Per-request config overrides bypass the failover chain;
                 // without an override we walk the installed chain (or the
                 // plain config when no chain is set).
-                let chain: crate::FailoverChain = match config {
+                let has_override = config.is_some();
+                let mut chain: crate::FailoverChain = match config {
                     Some(config) => vec![("provider".to_string(), *config)],
                     None if !self.state.failover_chain.is_empty() => {
                         self.state.failover_chain.clone()
@@ -128,11 +129,28 @@ impl SamplerActor {
                 };
                 // Start at the selected model's entry so switching models
                 // does not replay providers earlier in the chain.
-                let start_index = request_inner
+                let mut start_index = request_inner
                     .model
                     .as_ref()
-                    .and_then(|m| chain.iter().position(|(_, c)| &c.model == m))
-                    .unwrap_or(0);
+                    .and_then(|m| chain.iter().position(|(_, c)| &c.model == m));
+                if request_inner.model.is_some()
+                    && start_index.is_none()
+                    && !has_override
+                    && !self.state.failover_chain.is_empty()
+                {
+                    // The selected model is not a chain entry — typically the
+                    // built-in GROK selection, which lives in the session
+                    // config (first-party endpoint, session auth, the user's
+                    // exact model id and effort), not in [failover].order.
+                    // Lead the walk with it so GROK is always the first
+                    // provider tried, then the providers list; every request
+                    // re-walks from the top, so a limit reset is recovered.
+                    let mut led = vec![("grok".to_string(), self.state.config.clone())];
+                    led.append(&mut chain);
+                    chain = led;
+                    start_index = Some(0);
+                }
+                let start_index = start_index.unwrap_or(0);
                 self.tasks.spawn(request_task::run_chain_task(
                     request_id,
                     request_inner,

@@ -690,13 +690,14 @@ impl SessionActor {
         // from the top — the reconstruction below swaps in the served
         // entry's model id so sidecars do not send a model the serving
         // endpoint does not know. Prefer the served entry, then a chain
-        // entry matching the original selection; on a fresh resume (no serve
-        // reported yet, selection not in the chain) fall back to the chain
-        // head so sidecars follow the same first provider the main turn's
-        // walk will use, instead of the dead default endpoint.
+        // entry matching the original selection. A selection missing from
+        // the chain is the built-in GROK head when its endpoint is
+        // first-party xAI: the main turn's walk leads with the session
+        // config itself, so sidecars adopt that too. Only a non-first-party
+        // selection absent from the chain falls back to the chain head.
         let served = self.served_provider.lock().clone();
         let chain = self.sampler_handle.poll_chain().await;
-        let chain_entry = served
+        let mut chain_entry = served
             .as_ref()
             .and_then(|(name, model)| {
                 chain
@@ -704,8 +705,10 @@ impl SessionActor {
                     .find(|(n, sc)| n.as_str() == name.as_str() && sc.model == model.as_str())
             })
             .or_else(|| chain.iter().find(|(_, sc)| sc.model == cfg.model))
-            .or_else(|| chain.first())
             .cloned();
+        if chain_entry.is_none() && !crate::util::is_xai_api_url(&cfg.base_url) {
+            chain_entry = chain.first().cloned();
+        }
         let chain_entry = chain_entry.as_ref();
         // Gate on the stable session classifier, not `creds.auth_type` — see
         // `crate::agent::auth_method::session_token_auth_gate`. `cfg.base_url`

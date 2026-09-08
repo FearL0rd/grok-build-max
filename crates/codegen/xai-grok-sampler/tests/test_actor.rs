@@ -1890,3 +1890,120 @@ async fn poll_chain_is_empty_before_install() {
     );
     assert!(handle.poll_chain().await.is_empty());
 }
+
+/// Product rule: built-in GROK is always tried first. When the selected
+/// model is not a chain entry, the walk must lead with the session's own
+/// config (the GROK selection) under the "grok" provider name, then fall
+/// through to the `[failover].order` chain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grok_selection_leads_the_chain_when_not_a_chain_entry() {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            let events = sse::chat_completion_events("hi", "test-model");
+            Sse::new(stream::iter(
+                events.into_iter().map(Ok::<_, std::convert::Infallible>),
+            ))
+        }),
+    );
+    let server = MockServer::spawn(app).await;
+    let dead = "http://127.0.0.1:9/v1";
+    // Session config = the built-in GROK selection (live server). The
+    // installed chain holds only third-party providers.
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let handle = SamplerActor::spawn(
+        test_config(server.base_url(), "grok-4.6"),
+        RetryPolicy::default(),
+        event_tx,
+    );
+    handle.update_chain(vec![(
+        "glm".to_string(),
+        test_config(dead.to_string(), "glm-4.6"),
+    )]);
+    let mut request = user_request("say hi");
+    request.model = Some("grok-4.6".to_string());
+    handle.submit(RequestId::from("grok-lead-1"), request);
+
+    let mut served: Option<(String, String)> = None;
+    loop {
+        let ev = tokio::time::timeout(Duration::from_secs(10), event_rx.recv())
+            .await
+            .expect("timed out")
+            .expect("channel closed");
+        match ev {
+            SamplingEvent::ProviderServed { name, model, .. } => {
+                served = Some((name.to_string(), model.to_string()));
+            }
+            SamplingEvent::ProviderRolledOver { .. } | SamplingEvent::ProviderFailed { .. } => {
+                panic!("GROK head must be tried first and succeed; got {ev:?}")
+            }
+            SamplingEvent::Completed { .. } => break,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        served,
+        Some(("grok".to_string(), "grok-4.6".to_string())),
+        "the session's GROK config must serve before any chain provider"
+    );
+    server.shutdown();
+}
+
+/// An explicit in-chain selection keeps its position: no GROK head is
+/// prepended and earlier providers are not replayed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_chain_selection_starts_at_its_entry() {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            let events = sse::chat_completion_events("hi", "test-model");
+            Sse::new(stream::iter(
+                events.into_iter().map(Ok::<_, std::convert::Infallible>),
+            ))
+        }),
+    );
+    let server = MockServer::spawn(app).await;
+    let dead = "http://127.0.0.1:9/v1";
+    // Session config points at a dead GROK endpoint: if the head were
+    // (wrongly) prepended for an in-chain selection, this test would fail.
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let handle = SamplerActor::spawn(
+        test_config(dead.to_string(), "grok-4.6"),
+        RetryPolicy::default(),
+        event_tx,
+    );
+    handle.update_chain(vec![
+        ("glm".to_string(), test_config(server.base_url(), "glm-4.6")),
+        (
+            "nvidia".to_string(),
+            test_config(dead.to_string(), "llama"),
+        ),
+    ]);
+    let mut request = user_request("say hi");
+    request.model = Some("glm-4.6".to_string());
+    handle.submit(RequestId::from("grok-lead-2"), request);
+
+    let mut served: Option<(String, String)> = None;
+    loop {
+        let ev = tokio::time::timeout(Duration::from_secs(10), event_rx.recv())
+            .await
+            .expect("timed out")
+            .expect("channel closed");
+        match ev {
+            SamplingEvent::ProviderServed { name, model, .. } => {
+                served = Some((name.to_string(), model.to_string()));
+            }
+            SamplingEvent::ProviderRolledOver { .. } | SamplingEvent::ProviderFailed { .. } => {
+                panic!("selected chain entry must serve directly; got {ev:?}")
+            }
+            SamplingEvent::Completed { .. } => break,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        served,
+        Some(("glm".to_string(), "glm-4.6".to_string())),
+        "an in-chain selection must start at its own entry"
+    );
+    server.shutdown();
+}
