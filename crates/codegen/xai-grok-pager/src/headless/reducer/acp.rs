@@ -84,6 +84,20 @@ enum AcpLine {
     ImageCompressed {
         message: String,
     },
+    MemoryFlushStarted,
+    MemoryFlushCompleted {
+        result: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+    },
+    MemoryCaptureActivity {
+        activity: String,
+        from_turn: u32,
+        through_turn: u32,
+        attempt: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
 }
 
 /// `streaming-json` terminal `end` line (spend fields merged in by the caller).
@@ -197,5 +211,22 @@ fn acp_lifecycle_line(l: Lifecycle) -> AcpLine {
         Lifecycle::CompactCancelled => AcpLine::AutoCompactCancelled,
         Lifecycle::AutoContinue { total_tokens } => AcpLine::AutoContinueCompleted { total_tokens },
         Lifecycle::ImageCompressed { message } => AcpLine::ImageCompressed { message },
+        Lifecycle::MemoryFlushStarted => AcpLine::MemoryFlushStarted,
+        Lifecycle::MemoryFlushCompleted { result, path } => {
+            AcpLine::MemoryFlushCompleted { result, path }
+        }
+        Lifecycle::MemoryCaptureActivity {
+            activity,
+            from_turn,
+            through_turn,
+            attempt,
+            detail,
+        } => AcpLine::MemoryCaptureActivity {
+            activity,
+            from_turn,
+            through_turn,
+            attempt,
+            detail,
+        },
     }
 }

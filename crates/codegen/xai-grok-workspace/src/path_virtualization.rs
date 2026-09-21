@@ -1,9 +1,8 @@
 //! Per-session guest path virtualization and bind-time mount hooks.
 //!
-//! The model sees [`VISIBLE_ROOT`]; the guest tree is `real_root`
-//! (`/workspace/<conversation_id>`). Inbound also accepts today's
-//! [`ARTIFACTS_ALIAS`]. A `..` walk out of `/workspace`, the artifacts
-//! alias, or the already-guest real root is clipped to `real_root`.
+//! The model sees [`VISIBLE_ROOT`]; the guest tree is `real_root` (`/workspace/<conversation_id>`).
+//! Inbound also accepts [`ARTIFACTS_ALIAS`].
+//! A `..` walk out of `/workspace`, the artifacts alias, or the already-guest real root is clipped to `real_root`.
 //! True non-workspace absolutes (`/tmp`, `/home`) are left unchanged.
 
 use std::borrow::Cow;
@@ -20,23 +19,41 @@ pub const VISIBLE_ROOT: &str = "/workspace";
 /// Legacy model cwd; inbound alias of the session root.
 pub const ARTIFACTS_ALIAS: &str = "/workspace/artifacts";
 
-/// `visible_root` ↔ `real_root` mapping for one hub session.
+/// Two-way mapping between `visible_root` and `real_root` for one hub session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathVirtualization {
     visible_root: String,
     real_root: String,
+    /// Extra inbound spelling of `visible_root`; `None` for mappings that have no legacy alias.
+    alias: Option<&'static str>,
 }
 
 impl PathVirtualization {
     /// Build a mapping if `session_root` is a usable absolute guest path.
-    ///
-    /// Returns `None` for empty, relative, or `.`/`..` paths so a malformed
-    /// bind field cannot enable a broken rewrite.
+    /// Returns `None` for empty, relative, or `.`/`..` paths so a malformed bind field cannot enable a broken rewrite.
     pub fn try_from_session_root(session_root: impl AsRef<Path>) -> Option<Self> {
         let real = normalize_session_root(session_root.as_ref().to_str()?)?;
         Some(Self {
             visible_root: VISIBLE_ROOT.to_owned(),
             real_root: real,
+            alias: Some(ARTIFACTS_ALIAS),
+        })
+    }
+
+    /// Build a mapping between two arbitrary absolute roots with no alias.
+    /// Returns `None` when either root is not a usable absolute path, or when
+    /// `real_root` is `visible_root` or lies under it: a real tree inside its
+    /// own visible tree would make [`Self::to_guest`] map paths back onto themselves.
+    pub fn try_new(visible_root: impl AsRef<Path>, real_root: impl AsRef<Path>) -> Option<Self> {
+        let visible = normalize_session_root(visible_root.as_ref().to_str()?)?;
+        let real = normalize_session_root(real_root.as_ref().to_str()?)?;
+        if path_prefix_match(&real, &visible).is_some() {
+            return None;
+        }
+        Some(Self {
+            visible_root: visible,
+            real_root: real,
+            alias: None,
         })
     }
 
@@ -52,21 +69,18 @@ impl PathVirtualization {
         PathBuf::from(&self.real_root)
     }
 
-    /// Outbound: guest path → model-visible path. Unrelated paths unchanged.
+    /// Outbound: rewrites a guest path to the model-visible path; unrelated paths are unchanged.
     pub fn to_model_visible<'a>(&self, path: &'a str) -> Cow<'a, str> {
         replace_path_prefix(path, &self.real_root, &self.visible_root)
     }
 
-    /// Inbound: model path → guest path. `/workspace` and `/workspace/artifacts`
-    /// both map to `real_root`. Already-guest paths under `real_root` stay put.
-    ///
-    /// A `..` walk that would leave `real_root` is clipped to `real_root`.
-    /// Passing the original through would still resolve on the kernel to a
-    /// sibling tree. Absolute escapes such as `/tmp` and `/home` are left as-is.
+    /// Inbound: rewrite a model path to the guest path. `visible_root` and the alias (when set) map to `real_root`; paths already under it stay put.
+    /// A `..` walk that would leave `real_root` is clipped there; absolute escapes such as `/tmp` are left as-is.
     pub fn to_guest<'a>(&self, path: &'a str) -> Cow<'a, str> {
+        let alias_rest = self.alias.and_then(|alias| path_prefix_match(path, alias));
         let mapped = if path_prefix_match(path, &self.real_root).is_some() {
             Cow::Borrowed(path)
-        } else if let Some(rest) = path_prefix_match(path, ARTIFACTS_ALIAS) {
+        } else if let Some(rest) = alias_rest {
             Cow::Owned(join_root_suffix(&self.real_root, rest))
         } else if let Some(rest) = path_prefix_match(path, &self.visible_root) {
             Cow::Owned(join_root_suffix(&self.real_root, rest))
@@ -136,8 +150,8 @@ impl PathVirtualization {
     }
 }
 
-/// Guest POSIX root: absolute, ≥1 segment, no `.`/`..`. Trailing `/` and
-/// empty segments (`//`) are dropped so prefix match cannot miss.
+/// Guest POSIX root: absolute, at least one segment, no `.`/`..`.
+/// Trailing `/` and empty segments (`//`) are dropped so prefix match cannot miss.
 fn normalize_session_root(path: &str) -> Option<String> {
     if !path.starts_with('/') {
         return None;
@@ -158,8 +172,7 @@ fn normalize_session_root(path: &str) -> Option<String> {
     Some(format!("/{}", parts.join("/")))
 }
 
-/// Collapse `.` / `..` without touching the filesystem. `None` if `..`
-/// walks above `/`.
+/// Collapse `.` / `..` without touching the filesystem. `None` if `..` walks above `/`.
 fn lexically_normalize(path: &str) -> Option<String> {
     if !path.starts_with('/') {
         return None;
@@ -232,12 +245,13 @@ fn replace_path_prefix_in_text<'a>(text: &'a str, from: &str, to: &str) -> Cow<'
     let mut out: Option<String> = None;
     let mut i = 0;
     while i < bytes.len() {
-        if text[i..].starts_with(from) {
+        if text.get(i..).is_some_and(|rest| rest.starts_with(from)) {
             let end = i + from.len();
-            let ok_before = i == 0 || !is_path_token_char(bytes[i - 1]);
-            let ok_after = end == bytes.len() || !is_path_token_char(bytes[end]);
+            let ok_before = i == 0 || bytes.get(i - 1).is_none_or(|b| !is_path_token_char(*b));
+            let ok_after =
+                end == bytes.len() || bytes.get(end).is_none_or(|b| !is_path_token_char(*b));
             if ok_before && ok_after {
-                let buf = out.get_or_insert_with(|| text[..i].to_owned());
+                let buf = out.get_or_insert_with(|| text.get(..i).unwrap_or("").to_owned());
                 buf.push_str(to);
                 i = end;
                 continue;
@@ -255,8 +269,7 @@ fn replace_path_prefix_in_text<'a>(text: &'a str, from: &str, to: &str) -> Cow<'
     }
 }
 
-/// Rewrite each absolute path token through [`PathVirtualization::to_guest`]
-/// so a `..` walk-out inside prose is clipped the same way as a lone path.
+/// Rewrite each absolute path token through [`PathVirtualization::to_guest`] so a `..` walk-out inside prose is clipped the same way as a lone path.
 fn rewrite_text_inbound<'a>(virt: &PathVirtualization, text: &'a str) -> Cow<'a, str> {
     if !text.contains('/') {
         return Cow::Borrowed(text);
@@ -265,9 +278,13 @@ fn rewrite_text_inbound<'a>(virt: &PathVirtualization, text: &'a str) -> Cow<'a,
     let mut out: Option<String> = None;
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'/' && (i == 0 || !is_path_token_char(bytes[i - 1])) {
+        if bytes.get(i) == Some(&b'/')
+            && (i == 0 || bytes.get(i - 1).is_none_or(|b| !is_path_token_char(*b)))
+        {
             let end = path_token_end(bytes, i);
-            let token = &text[i..end];
+            let Some(token) = text.get(i..end) else {
+                break;
+            };
             match virt.to_guest(token) {
                 Cow::Borrowed(_) => {
                     if let Some(buf) = &mut out {
@@ -275,7 +292,7 @@ fn rewrite_text_inbound<'a>(virt: &PathVirtualization, text: &'a str) -> Cow<'a,
                     }
                 }
                 Cow::Owned(mapped) => {
-                    out.get_or_insert_with(|| text[..i].to_owned())
+                    out.get_or_insert_with(|| text.get(..i).unwrap_or("").to_owned())
                         .push_str(&mapped);
                 }
             }
@@ -294,8 +311,7 @@ fn rewrite_text_inbound<'a>(virt: &PathVirtualization, text: &'a str) -> Cow<'a,
     }
 }
 
-/// Advance one UTF-8 scalar at `i`. `i` is a char boundary because the
-/// scanners start at 0 and step by `char::len_utf8`.
+/// Advance one UTF-8 scalar at `i`. `i` is a char boundary because the scanners start at 0 and step by `char::len_utf8`.
 fn push_char_at(text: &str, i: usize, buf: Option<&mut String>) -> usize {
     let Some(ch) = text.get(i..).and_then(|s| s.chars().next()) else {
         return 1;
@@ -308,7 +324,10 @@ fn push_char_at(text: &str, i: usize, buf: Option<&mut String>) -> usize {
 
 fn path_token_end(bytes: &[u8], start: usize) -> usize {
     let mut end = start + 1;
-    while end < bytes.len() && (bytes[end] == b'/' || is_path_token_char(bytes[end])) {
+    while bytes
+        .get(end)
+        .is_some_and(|b| *b == b'/' || is_path_token_char(*b))
+    {
         end += 1;
     }
     end
@@ -335,11 +354,9 @@ fn rewrite_json_strings(value: Value, rewrite: &dyn Fn(&str) -> Cow<str>) -> Val
     }
 }
 
-/// Write/edit bodies and search/monitor regexes mention `/workspace` as
-/// file content, not as a path argument. Rewriting them would persist the
-/// guest root on disk, break `search_replace` against the original bytes,
-/// and make grep / `notify_on_output` miss on-disk text that still uses
-/// the visible root.
+/// Write/edit bodies and search/monitor regexes mention `/workspace` as file content, not as a path argument.
+/// Rewriting them would persist the guest root on disk and break `search_replace` against the original bytes.
+/// grep and `notify_on_output` would miss on-disk text that still uses the visible root.
 fn is_content_like_json_key(key: &str) -> bool {
     matches!(
         key,
@@ -440,9 +457,7 @@ fn rewrite_chat_completion_output(
     }
 }
 
-// ---------------------------------------------------------------------------
 // Bind-time mount hook (probe-then-mount; unbind must not unmount)
-// ---------------------------------------------------------------------------
 
 /// Context passed to bind/unbind lifecycle hooks.
 #[derive(Debug, Clone, Copy)]
@@ -467,8 +482,8 @@ type ProbeFn = Arc<dyn Fn(&Path) -> bool + Send + Sync>;
 type MountFn = Arc<dyn Fn(&Path) -> Result<(), BindMountError> + Send + Sync>;
 type UnbindFn = Arc<dyn Fn(&str, &Path) + Send + Sync>;
 
-/// Probe-then-mount seam. Default is a no-op until a command is configured;
-/// `on_unbind` must not unmount (the guest mount outlives the hub session).
+/// Probe-then-mount hook, a no-op until a command is configured.
+/// `on_unbind` must not unmount: the guest mount outlives the hub session.
 pub struct BindMountHook {
     probe: Option<ProbeFn>,
     mount: Option<MountFn>,

@@ -293,7 +293,7 @@ async fn run_one_provider(
         &client.auth_info(),
     );
     if let Some(eff) = config.reasoning_effort {
-        sampling_span.record("reasoning_effort", eff.as_str());
+        sampling_span.record("reasoning_effort", eff.as_ref());
     }
 
     let mut request = request;
@@ -377,7 +377,7 @@ async fn run_one_provider(
                 tracing::warn!(
                     target: crate::sampling_log::TARGET,
                     empty_response = true,
-                    empty_reason = context.reason.as_str(),
+                    empty_reason = context.reason.as_ref(),
                     had_reasoning = context.had_reasoning,
                     content_len = context.content_len,
                     tool_call_count = context.tool_call_count,
@@ -549,6 +549,10 @@ async fn apply_retry_decision(
     } else {
         retry_policy.rate_limit_retry_threshold
     };
+    // Per-config override (config.toml `[sampling] rate_limit_retry_threshold`) wins over the policy default.
+    let rate_limit_threshold = config
+        .rate_limit_retry_threshold
+        .unwrap_or(rate_limit_threshold);
     let decision = classify_error(err, *retry_count, max_retries, rate_limit_threshold);
 
     // Connection-reset / broken-pipe on body upload often means nginx
@@ -607,35 +611,10 @@ async fn apply_retry_decision(
                 // Nothing left to strip; upgrade to fatal.
                 return LoopControl::Terminal(clone_error(err));
             }
-            // Only the deterministic signal (a 400 stamped with the
-            // invalid-image code) is a server rejection. Everything else
-            // that reaches this arm (413 body-size verdicts, proxy-wrapped
-            // 500s, the legacy phrase match, coded mid-stream errors) is a
-            // heuristic that must stay request-local.
-            // Exhaustive: a new error variant must choose its strip label
-            // here instead of silently landing on the heuristic branch.
-            let reason = match err {
-                SamplingError::Api {
-                    status,
-                    error_code: Some(ApiErrorCode::InvalidImage),
-                    ..
-                } if status.as_u16() == 400 => StripReason::ServerRejected,
-                SamplingError::Api { .. }
-                | SamplingError::StreamError { .. }
-                | SamplingError::Auth { .. }
-                | SamplingError::InvalidConfiguration(_)
-                | SamplingError::Http(_)
-                | SamplingError::Serialization(_)
-                | SamplingError::EventStreamError(_)
-                | SamplingError::IdleTimeout { .. }
-                | SamplingError::EmptyResponse { .. }
-                | SamplingError::MaxTokensTruncation
-                | SamplingError::DoomLoopDetected { .. }
-                | SamplingError::ProviderFailed { .. } => StripReason::PayloadHeuristic,
-            };
+            let reason = strip_reason_for_image_error(err);
             tracing::warn!(
                 stripped = stripped_urls.len(),
-                reason = reason.as_str(),
+                reason = reason.as_ref(),
                 error = %err,
                 "stripped {} image(s) after an image-related error; retrying without them",
                 stripped_urls.len()
@@ -709,6 +688,10 @@ async fn apply_retry_decision(
 }
 
 async fn sleep_or_cancel(duration: Duration, cancel_token: &CancellationToken) -> bool {
+    let _backoff = crate::span_timing::Region::from_span(tracing::info_span!(
+        "sampling.retry_backoff",
+        backoff_ms = duration.as_millis() as i64,
+    ));
     tokio::select! {
         biased;
         _ = cancel_token.cancelled() => false,
@@ -1101,7 +1084,7 @@ fn build_empty_context(
         None => (0, 0, String::new(), false),
     };
 
-    let finish_reason = response.stop_reason.map(|sr| sr.as_str().to_owned());
+    let finish_reason = response.stop_reason.map(|sr| sr.as_ref().to_owned());
     let (completion_tokens, reasoning_tokens, prompt_tokens) = response
         .usage
         .as_ref()
@@ -1155,10 +1138,40 @@ fn emit_retrying(
         attempt,
         max_retries,
         kind: info.kind,
-        reason: err.to_string(),
+        reason: err.detail_with_causes(),
         doom_loop_triggers: info.doom_loop_triggers,
         doom_loop_aborted_at_chunk: info.doom_loop_aborted_at_chunk,
     });
+}
+
+/// Why images were stripped before a retry. A coded invalid-image verdict (Api or mid-stream) is a server
+/// rejection; everything else that reaches the strip path (413 body-size verdicts, proxy-wrapped 500s, legacy
+/// phrase matches) is a request-local heuristic. Exhaustive: a new `SamplingError` variant must pick a label
+/// here instead of silently landing on the heuristic branch.
+fn strip_reason_for_image_error(err: &SamplingError) -> StripReason {
+    match err {
+        SamplingError::Api {
+            error_code: Some(ApiErrorCode::InvalidImage),
+            ..
+        }
+        | SamplingError::StreamError {
+            code: Some(ApiErrorCode::InvalidImage),
+            ..
+        } => StripReason::ServerRejected,
+        SamplingError::Api { .. }
+        | SamplingError::StreamError { .. }
+        | SamplingError::Auth { .. }
+        | SamplingError::InvalidConfiguration(_)
+        | SamplingError::MtlsConfiguration(_)
+        | SamplingError::Http(_)
+        | SamplingError::Serialization(_)
+        | SamplingError::EventStreamError(_)
+        | SamplingError::IdleTimeout { .. }
+        | SamplingError::EmptyResponse { .. }
+        | SamplingError::MaxTokensTruncation
+        | SamplingError::DoomLoopDetected { .. }
+        | SamplingError::ProviderFailed { .. } => StripReason::PayloadHeuristic,
+    }
 }
 
 fn emit_images_stripped(
@@ -1573,6 +1586,57 @@ mod tests {
         assert!(
             round_tripped.is_image_processing_error(),
             "stream-sourced round trip must still classify: {round_tripped:?}"
+        );
+    }
+
+    /// Coded invalid-image errors must map to `ServerRejected` on both transports:
+    /// Api (chat 400 and the Responses-synthesized 500) and coded mid-stream StreamError.
+    #[test]
+    fn strip_reason_invalid_image_is_server_rejected_on_api_and_stream() {
+        let api_400 = SamplingError::Api {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            message: "Invalid PNG image.".into(),
+            model_metadata: None,
+            retry_after_secs: None,
+            should_retry: None,
+            error_code: Some(ApiErrorCode::InvalidImage),
+        };
+        assert_eq!(
+            strip_reason_for_image_error(&api_400),
+            StripReason::ServerRejected
+        );
+
+        let api_500 = SamplingError::Api {
+            status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            message: "invalid_image: Invalid PNG image.".into(),
+            model_metadata: None,
+            retry_after_secs: None,
+            should_retry: None,
+            error_code: Some(ApiErrorCode::InvalidImage),
+        };
+        assert_eq!(
+            strip_reason_for_image_error(&api_500),
+            StripReason::ServerRejected
+        );
+
+        let stream = SamplingError::StreamError {
+            error_type: "invalid_request_error".into(),
+            message: "Invalid PNG image.".into(),
+            code: Some(ApiErrorCode::InvalidImage),
+        };
+        assert_eq!(
+            strip_reason_for_image_error(&stream),
+            StripReason::ServerRejected
+        );
+
+        let heuristic = SamplingError::StreamError {
+            error_type: "overloaded_error".into(),
+            message: "The server is overloaded.".into(),
+            code: None,
+        };
+        assert_eq!(
+            strip_reason_for_image_error(&heuristic),
+            StripReason::PayloadHeuristic
         );
     }
 

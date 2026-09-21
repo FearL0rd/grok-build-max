@@ -1,7 +1,6 @@
-//! Shared harness for the subagent latency sweep and the bootstrap-cost
-//! regression tier. Included by BOTH test binaries via `#[path]`: the
-//! regression tier lives in its own binary because the waterfall sink and
-//! env latch once per process.
+//! Shared harness for the subagent latency sweep and the bootstrap-cost regression tier.
+//! Both test binaries include this file via `#[path]`.
+//! The regression tier lives in its own binary because the waterfall sink and env latch once per process.
 #![allow(dead_code)]
 
 use std::time::{Duration, Instant};
@@ -10,6 +9,7 @@ use agent_client_protocol::{self as acp, Agent as _};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use xai_grok_shell::waterfall;
+use xai_grok_test_support::mock_server::LogEntry;
 use xai_grok_test_support::{
     InferenceEndpoint, InferenceRequestMatcher, MockInferenceServer, ResourceSnapshot, RssSampler,
     ScriptedResponse, SseEvent,
@@ -36,8 +36,106 @@ pub fn probe_id(n: usize, i: usize) -> String {
     format!("swp-{n}-{i:03}")
 }
 
-/// One assistant response with N parallel task calls, one delta chunk per
-/// call; the script speaks wire names (`spawn_subagent`, `background`).
+/// One scripted `spawn_subagent` call; `task_id` injects the child's session id.
+pub struct SpawnProbe<'a> {
+    pub subagent_type: &'a str,
+    pub description: &'a str,
+    pub prompt: &'a str,
+    pub task_id: &'a str,
+    pub background: bool,
+}
+
+/// One assistant response spawning a single child under an injected id; the script speaks wire names
+/// (`spawn_subagent`, `background`).
+pub fn spawn_probe_sse(probe: &SpawnProbe<'_>) -> ScriptedResponse {
+    let args = json!({
+        "description": probe.description,
+        "prompt": probe.prompt,
+        "subagent_type": probe.subagent_type,
+        "background": probe.background,
+        "task_id": probe.task_id,
+    });
+    ScriptedResponse::sse(vec![
+        chat_chunk(
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_probe",
+                    "type": "function",
+                    "function": { "name": "spawn_subagent", "arguments": args.to_string() }
+                }]
+            }),
+            Value::Null,
+        ),
+        chat_chunk(json!({}), json!("tool_calls")),
+        SseEvent::data("[DONE]"),
+    ])
+}
+
+/// Title and other side queries hit the same path without `x-grok-turn-idx`.
+pub fn is_foreground(entry: &LogEntry) -> bool {
+    entry.method == "POST"
+        && entry.path.contains("chat/completions")
+        && entry
+            .header("x-grok-turn-idx")
+            .is_some_and(|v| !v.trim().is_empty())
+}
+
+pub fn messages(body: &Value) -> &[Value] {
+    body["messages"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+}
+
+pub fn message_text(message: &Value) -> String {
+    match &message["content"] {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| part["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        other => other.to_string(),
+    }
+}
+
+/// A prompt turn ends in the user message carrying that prompt; follow-ups end in a `tool` message.
+pub fn ends_with_user_prompt(body: &Value, prompt: &str) -> bool {
+    messages(body)
+        .last()
+        .is_some_and(|message| message["role"] == "user" && message_text(message).contains(prompt))
+}
+
+/// Only the child's own turn carries its prompt as a user message; the parent sees it inside tool-call arguments.
+pub fn has_user_prompt(body: &Value, prompt: &str) -> bool {
+    messages(body)
+        .iter()
+        .any(|message| message["role"] == "user" && message_text(message).contains(prompt))
+}
+
+/// The one foreground chat-completions body satisfying `matches`; anything else is a test-scripting mistake.
+pub fn single_request(mock: &MockInferenceServer, matches: impl Fn(&Value) -> bool) -> Value {
+    let bodies: Vec<Value> = mock
+        .requests()
+        .into_iter()
+        .filter(is_foreground)
+        .filter_map(|entry| entry.body)
+        .filter(matches)
+        .collect();
+    let [body] = <[Value; 1]>::try_from(bodies).unwrap_or_else(|bodies| {
+        panic!(
+            "expected exactly one matching request, got {}\n{}",
+            bodies.len(),
+            mock.request_log_summary()
+        )
+    });
+    body
+}
+
+/// One assistant response with N parallel task calls, one delta chunk per call; the script speaks wire names (`spawn_subagent`, `background`).
 pub fn burst_tool_calls_sse(n: usize, isolation: &str) -> ScriptedResponse {
     let mut events = Vec::with_capacity(n + 2);
     for i in 0..n {
@@ -149,9 +247,8 @@ pub async fn warm_mock(origin: &str, k: usize) {
     eprintln!("WARMUP k={k} ok={ok} ms={}", t.elapsed().as_millis());
 }
 
-/// Emit one `MOCK_REQ` mark per probe: for each probe id, stamp the first mock
-/// chat request whose last message is that probe's user prompt, which skips
-/// tool-result follow-ups and the auto-wake echo.
+/// Emit one `MOCK_REQ` mark per probe: for each probe id, stamp the first mock chat request whose last message is that probe's user prompt.
+/// That match skips tool-result follow-ups and the auto-wake echo.
 pub fn emit_mock_request_marks(server: &MockInferenceServer, n: usize) {
     let mut seen: std::collections::HashSet<String> = Default::default();
     for e in server.requests() {
@@ -201,8 +298,7 @@ pub struct BurstOutcome {
     pub peak_fds: usize,
 }
 
-/// One N-subagent burst against `server`; the agent runs on its own thread,
-/// the client (this thread) stamps notification arrivals.
+/// One N-subagent burst against `server`; the agent runs on its own thread, the client (this thread) stamps notification arrivals.
 pub fn run_burst(
     server: &MockInferenceServer,
     n: usize,
@@ -213,8 +309,7 @@ pub fn run_burst(
     let repo = build_repo(repo_files);
     let repo_path = repo.path().to_path_buf();
 
-    // The first foreground chat request is the parent's opening turn; every
-    // later request falls through to echo mode.
+    // The first foreground chat request is the parent's opening turn; every later request falls through to echo mode
     let expectation = server.expect_response(
         format!("burst-{n}-{isolation}"),
         InferenceRequestMatcher::foreground(InferenceEndpoint::ChatCompletions),
@@ -321,7 +416,6 @@ pub fn run_burst(
         let mut failures = 0usize;
         for i in 0..n {
             let id = probe_id(n, i);
-            // Exact task_id match first, then positional fallback.
             let spawn_ms = rec
                 .dispatch
                 .iter()
@@ -376,9 +470,8 @@ pub fn run_burst(
     outcome
 }
 
-/// Process-wide scaffold shared by the sweep and regression binaries: the
-/// mock's own runtime (agent startup prefetch would starve a shared one),
-/// an isolated GROK_HOME, and the base test env.
+/// Process-wide scaffold shared by the sweep and regression binaries.
+/// The mock gets its own runtime because agent startup prefetch would starve a shared one.
 pub struct SweepEnv {
     pub mock_rt: tokio::runtime::Runtime,
     pub deadline: Duration,
@@ -431,8 +524,7 @@ pub fn burst_on_fresh_mock(env: &SweepEnv, n: usize, isolation: &str) -> BurstOu
     outcome
 }
 
-/// One burst per N; the per-N wrapper tests select N by test-name filter so
-/// no env plumbing is needed through remote runners.
+/// One burst per N; the per-N wrapper tests select N by test-name filter so no env var has to reach the remote runners.
 pub fn run_sweep(ns: &[usize], isolation: &str) {
     let env = sweep_env_init();
     for &n in ns {

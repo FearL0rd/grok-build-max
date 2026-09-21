@@ -1,9 +1,9 @@
-//! TLS policy for the grok CLI: OS roots, Mozilla roots, and opt-in extra
-//! roots from `GROK_EXTRA_CA_BUNDLE` (fallback: `SSL_CERT_FILE`). A bad bundle
-//! is logged and skipped, never failing client construction.
+//! TLS policy for the grok CLI: OS roots, Mozilla roots, and opt-in extra roots from `GROK_EXTRA_CA_BUNDLE` (fallback: `SSL_CERT_FILE`).
+//! A bad bundle is logged and skipped, never failing client construction.
 //!
-//! Every client pins rustls: feature unification can otherwise select
-//! native-tls, whose untyped errors break the certificate classifier.
+//! Every client pins rustls: feature unification can otherwise select native-tls, whose untyped errors break the certificate classifier.
+
+#![deny(clippy::indexing_slicing)]
 
 use std::io::Read;
 use std::sync::Arc;
@@ -19,15 +19,20 @@ pub const ENV_GROK_EXTRA_CA_BUNDLE: &str = "GROK_EXTRA_CA_BUNDLE";
 
 pub const ENV_SSL_CERT_FILE: &str = "SSL_CERT_FILE";
 
-/// First install wins; without a default, `ClientConfig::builder()` panics
-/// when `ring` and `aws-lc-rs` are both compiled in.
+/// ring on Windows ARM64: aws-lc-sys's jitterentropy is miscompiled for that target and overflows the stack on the first TLS handshake (xai-org/plugin-marketplace#426).
+const IS_RING_TARGET: bool = cfg!(all(windows, target_arch = "aarch64"));
+
+/// Installs aws-lc-rs, or ring where `IS_RING_TARGET`.
+/// First install wins; without a default, `ClientConfig::builder()` panics when `ring` and `aws-lc-rs` are both compiled in.
 pub fn ensure_default_crypto_provider() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        if rustls::crypto::aws_lc_rs::default_provider()
-            .install_default()
-            .is_err()
-        {
+        let provider = if IS_RING_TARGET {
+            rustls::crypto::ring::default_provider()
+        } else {
+            rustls::crypto::aws_lc_rs::default_provider()
+        };
+        if provider.install_default().is_err() {
             let supports_p521 = rustls::crypto::CryptoProvider::get_default().is_some_and(|p| {
                 p.signature_verification_algorithms
                     .supported_schemes()
@@ -43,9 +48,9 @@ pub fn ensure_default_crypto_provider() {
     });
 }
 
-/// Builds a reqwest client with the grok TLS policy: the shared roots (OS store,
-/// Mozilla bundle, and any extra roots), read once per process instead of on
-/// each build. For HTTP/1.1 only, add `http1_only()` in `configure`.
+/// Builds a reqwest client with the grok TLS policy: the shared roots (OS store, Mozilla bundle, and any extra roots).
+/// The roots are read once per process instead of on each build.
+/// For HTTP/1.1 only, add `http1_only()` in `configure`.
 #[allow(clippy::disallowed_methods)] // the approved async build path
 pub fn build_reqwest_client(
     configure: impl Fn(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
@@ -80,16 +85,16 @@ pub fn build_blocking_reqwest_client(
 #[cfg(test)]
 static NATIVE_ROOT_LOADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// The OS store and extra roots as reqwest certificates, parsed once per
-/// process. Mozilla roots come from reqwest's built-in webpki bundle.
+/// The OS store and extra roots as reqwest certificates, parsed once per process.
+/// Mozilla roots come from reqwest's built-in webpki bundle.
 fn shared_reqwest_roots() -> impl Iterator<Item = reqwest::Certificate> {
     static ROOTS: OnceLock<Vec<reqwest::Certificate>> = OnceLock::new();
     ROOTS
         .get_or_init(|| {
             cached_native_der()
                 .iter()
-                .map(|der| &der[..])
-                .chain(extra_root_ders().iter().map(|der| &der[..]))
+                .map(|der| der.as_ref())
+                .chain(extra_root_ders().iter().map(Vec::as_slice))
                 .filter_map(|der| {
                     reqwest::Certificate::from_der(der)
                         .inspect_err(|error| {
@@ -116,8 +121,7 @@ fn cached_native_der() -> &'static [CertificateDer<'static>] {
                 "skipping unreadable native root certificates"
             );
         }
-        // Keep only certificates rustls accepts, so one unparsable OS root
-        // cannot fail every client build.
+        // Keep only certificates rustls accepts, so one unparsable OS root cannot fail every client build
         native
             .certs
             .into_iter()
@@ -136,18 +140,13 @@ fn client_config_with_shared_roots() -> rustls::ClientConfig {
     roots.add_parsable_certificates(cached_native_der().iter().cloned());
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     roots.add_parsable_certificates(extra_root_ders().iter().cloned().map(CertificateDer::from));
-    #[expect(clippy::expect_used)]
-    rustls::ClientConfig::builder_with_provider(
-        rustls::crypto::aws_lc_rs::default_provider().into(),
-    )
-    .with_safe_default_protocol_versions()
-    .expect("aws-lc-rs supports the default protocol versions")
-    .with_root_certificates(roots)
-    .with_no_client_auth()
+    // Must stay on builder(): naming a provider here would bypass the per-target choice in ensure_default_crypto_provider.
+    rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth()
 }
 
-/// Shared rustls config for TLS outside reqwest (WebSocket, HTTP/1.1 upgrade),
-/// pinned to this crate's provider.
+/// Shared rustls config for TLS outside reqwest (WebSocket, HTTP/1.1 upgrade), using the process default provider.
 pub fn rustls_client_config() -> Arc<rustls::ClientConfig> {
     static CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
     CONFIG
@@ -162,6 +161,32 @@ pub fn rustls_client_config() -> Arc<rustls::ClientConfig> {
 /// The configured extra roots as validated DER, loaded once per process.
 pub fn extra_root_ders() -> &'static [Vec<u8>] {
     bundle_snapshot().ders.as_slice()
+}
+
+pub fn extra_root_pems() -> &'static [Vec<u8>] {
+    static PEMS: OnceLock<Vec<Vec<u8>>> = OnceLock::new();
+    PEMS.get_or_init(|| {
+        extra_root_ders()
+            .iter()
+            .map(|der| der_to_pem(der))
+            .collect()
+    })
+    .as_slice()
+}
+
+fn der_to_pem(der: &[u8]) -> Vec<u8> {
+    use base64::Engine as _;
+    let body = base64::engine::general_purpose::STANDARD.encode(der);
+    let mut pem = String::from("-----BEGIN CERTIFICATE-----\n");
+    let mut offset = 0;
+    while offset < body.len() {
+        let end = (offset + 64).min(body.len());
+        pem.push_str(body.get(offset..end).unwrap_or(""));
+        pem.push('\n');
+        offset = end;
+    }
+    pem.push_str("-----END CERTIFICATE-----\n");
+    pem.into_bytes()
 }
 
 /// The variable that fed the loaded roots, if any.
@@ -189,8 +214,7 @@ fn bundle_snapshot() -> &'static BundleSnapshot {
     })
 }
 
-/// `GROK_EXTRA_CA_BUNDLE` wins over `SSL_CERT_FILE`; an empty value disables
-/// both, since `SSL_CERT_FILE` is often set process-wide (Nix, conda).
+/// `GROK_EXTRA_CA_BUNDLE` wins over `SSL_CERT_FILE`; an empty value disables both, since `SSL_CERT_FILE` is often set process-wide (Nix, conda).
 fn configured_ca_bundle() -> Option<(&'static str, std::path::PathBuf)> {
     select_bundle(
         std::env::var_os(ENV_GROK_EXTRA_CA_BUNDLE),
@@ -198,9 +222,8 @@ fn configured_ca_bundle() -> Option<(&'static str, std::path::PathBuf)> {
     )
 }
 
-/// `GROK_EXTRA_CA_BUNDLE` wins over `SSL_CERT_FILE`; an empty value disables
-/// both, since `SSL_CERT_FILE` is often set process-wide (Nix, conda). Pure so
-/// precedence is unit-tested without touching the process environment.
+/// `GROK_EXTRA_CA_BUNDLE` wins over `SSL_CERT_FILE`; an empty value disables both, since `SSL_CERT_FILE` is often set process-wide (Nix, conda).
+/// Pure so precedence is unit-tested without touching the process environment.
 fn select_bundle(
     bundle: Option<std::ffi::OsString>,
     ssl: Option<std::ffi::OsString>,
@@ -340,8 +363,7 @@ fn normalize_trusted_certificate_labels(pem: &[u8]) -> Vec<u8> {
         .into_bytes()
 }
 
-/// The first DER object as a prefix of `der` (drops trailing bytes), or `None`
-/// if the header is malformed, over-long, or an unsupported length form.
+/// The first DER object as a prefix of `der` (drops trailing bytes), or `None` if the header is malformed, over-long, or an unsupported length form.
 fn first_der_item(der: &[u8]) -> Option<&[u8]> {
     if der.first() != Some(&0x30) {
         return None;
@@ -361,7 +383,7 @@ fn first_der_item(der: &[u8]) -> Option<&[u8]> {
     der.get(..header.checked_add(len)?)
 }
 
-#[allow(clippy::disallowed_methods)] // tests exercise the adapter's build seam directly
+#[allow(clippy::disallowed_methods)] // tests call the crate's build functions directly
 #[cfg(test)]
 #[path = "lib_tests.rs"]
 mod tests;

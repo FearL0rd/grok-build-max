@@ -1,15 +1,12 @@
 //! Optional Unicode Bidirectional Algorithm (UAX #9) for LTR terminal painting.
 //!
-//! **Off by default.** Many terminals already run implicit bidi; reordering in
-//! the app double-flips text on those hosts. Enable only when the terminal does
-//! not (`[scrollback.display] rtl_bidi = true`).
+//! **Off by default.** Many terminals already run implicit bidi; reordering in the app double-flips text on those hosts.
+//! Enable only when the terminal does not (`[scrollback.display] rtl_bidi = true`).
 //!
-//! When enabled (via [`set_line_safe_bidi`](super::SafeBuf::set_line_safe_bidi)
-//! on scrollback/list content): strip bidi override/isolate controls, reorder
-//! full display rows, reverse RTL runs by grapheme cluster, and mirror paired
-//! punctuation. Table rows stay logical so columns align. Base direction is
-//! resolved per painted row — a soft-wrapped continuation that starts with
-//! Latin may differ from the paragraph's first row.
+//! When enabled, [`set_line_safe_bidi`](super::SafeBuf::set_line_safe_bidi) applies the reorder to scrollback and list content.
+//! It strips bidi override/isolate controls, reorders full display rows, reverses RTL runs by grapheme cluster, and mirrors paired punctuation.
+//! Table rows stay logical so columns align.
+//! Base direction is resolved per painted row: a soft-wrapped continuation that starts with Latin may differ from the paragraph's first row.
 
 use std::borrow::Cow;
 use std::ops::Range;
@@ -72,7 +69,7 @@ pub(crate) fn paragraph_level(text: &str) -> Level {
         .unwrap_or_else(Level::ltr)
 }
 
-/// Logical → visual when enabled and needed; otherwise borrows.
+/// Reorders logical text to visual order when enabled and needed; otherwise borrows.
 /// When enabled, always strips bidi controls even for pure LTR.
 pub fn visual_text(text: &str) -> Cow<'_, str> {
     if !is_enabled() {
@@ -124,7 +121,7 @@ fn visual_text_line(text: &str, level: Level) -> String {
     out
 }
 
-/// Logical → visual styled line. `None` when disabled or no change needed.
+/// Reorders a styled line to visual order. `None` when disabled or no change needed.
 pub fn visual_line(line: &Line<'_>) -> Option<Line<'static>> {
     if !is_enabled() {
         return None;
@@ -170,7 +167,7 @@ pub(crate) fn visual_line_with_level(
 
     let para_level = level.unwrap_or_else(|| paragraph_level(&flat));
     let prefix = chrome_prefix_len(&flat);
-    let body = &flat[prefix..];
+    let body = flat.get(prefix..)?;
 
     // Controls-only LTR: rebuild the cleaned line without reordering.
     if body.is_empty() || !needs_bidi(body) {
@@ -187,7 +184,8 @@ pub(crate) fn visual_line_with_level(
 
     let mut out_spans: Vec<Span<'static>> = Vec::new();
     if prefix > 0 {
-        append_graphemes_styled(&flat[..prefix], 0, &span_bounds, &mut out_spans, false);
+        let head = flat.get(..prefix)?;
+        append_graphemes_styled(head, 0, &span_bounds, &mut out_spans, false);
     }
     append_reordered_body(body, prefix, &span_bounds, &mut out_spans, para_level);
 
@@ -205,8 +203,8 @@ pub fn logical_slice_for_visual_cols(text: &str, vis_start: usize, vis_end: usiz
     if !is_enabled() {
         return slice_display_cols(text, vis_start, vis_end);
     }
-    // Classify on the stripped string so table/needs_bidi decisions match paint
-    // (which strips first). A leading bidi control must not flip the decision.
+    // Classify on the stripped string so table/needs_bidi decisions match paint (which strips first)
+    // A leading bidi control must not flip the decision
     let cleaned = strip_bidi_controls(text);
     let text = cleaned
         .as_ref()
@@ -217,12 +215,15 @@ pub fn logical_slice_for_visual_cols(text: &str, vis_start: usize, vis_end: usiz
         return slice_display_cols(text, vis_start, vis_end);
     }
     let prefix = chrome_prefix_len(text);
-    let prefix_cols = str_cells(&text[..prefix]);
+    let Some(head) = text.get(..prefix) else {
+        return slice_display_cols(text, vis_start, vis_end);
+    };
+    let prefix_cols = str_cells(head);
     let mut out = String::new();
 
     if vis_start < prefix_cols {
         out.push_str(&slice_display_cols(
-            &text[..prefix],
+            head,
             vis_start,
             vis_end.min(prefix_cols),
         ));
@@ -231,7 +232,9 @@ pub fn logical_slice_for_visual_cols(text: &str, vis_start: usize, vis_end: usiz
         return out;
     }
 
-    let body = &text[prefix..];
+    let Some(body) = text.get(prefix..) else {
+        return out;
+    };
     let body_vs = vis_start.saturating_sub(prefix_cols);
     let body_ve = vis_end.saturating_sub(prefix_cols);
     if body_vs >= body_ve {
@@ -248,12 +251,19 @@ pub fn logical_slice_for_visual_cols(text: &str, vis_start: usize, vis_end: usiz
     let mut vis_col_of = vec![0usize; graphemes.len()];
     let mut vcol = 0usize;
     for &gi in &visual_order {
-        vis_col_of[gi] = vcol;
-        vcol += UnicodeWidthStr::width(graphemes[gi]);
+        if let Some(slot) = vis_col_of.get_mut(gi) {
+            *slot = vcol;
+        }
+        vcol += match graphemes.get(gi) {
+            Some(g) => UnicodeWidthStr::width(*g),
+            None => 0,
+        };
     }
     for (gi, g) in graphemes.iter().enumerate() {
         let w = UnicodeWidthStr::width(*g);
-        let vc = vis_col_of[gi];
+        let Some(&vc) = vis_col_of.get(gi) else {
+            continue;
+        };
         if w == 0 {
             continue;
         }
@@ -264,10 +274,9 @@ pub fn logical_slice_for_visual_cols(text: &str, vis_start: usize, vis_end: usiz
     out
 }
 
-/// Inverse of the paint reorder: the logical display column of the grapheme
-/// painted at `visual_col`. For surfaces that keep selection endpoints in
-/// logical columns but hit-test painted cells (the block viewer drag). Identity
-/// when reordering is off / a table row / no RTL; clamps past-end to the width.
+/// Inverse of the paint reorder: the logical display column of the grapheme painted at `visual_col`.
+/// Surfaces that keep selection endpoints in logical columns but hit-test painted cells (the block viewer drag) use this.
+/// Identity when reordering is off, the row is a table, or there is no RTL; clamps past-end to the width.
 pub fn visual_col_to_logical_col(text: &str, visual_col: usize) -> usize {
     if !is_enabled() {
         return visual_col;
@@ -282,8 +291,13 @@ pub fn visual_col_to_logical_col(text: &str, visual_col: usize) -> usize {
         return visual_col;
     }
     let prefix = chrome_prefix_len(text);
-    let prefix_cols = str_cells(&text[..prefix]);
-    let body = &text[prefix..];
+    let Some(head) = text.get(..prefix) else {
+        return visual_col.min(str_cells(text));
+    };
+    let prefix_cols = str_cells(head);
+    let Some(body) = text.get(prefix..) else {
+        return visual_col.min(prefix_cols);
+    };
     // Chrome is painted logically (not reordered), so columns there are 1:1.
     if visual_col < prefix_cols || !needs_bidi(body) {
         return visual_col.min(prefix_cols + str_cells(body));
@@ -296,17 +310,26 @@ pub fn visual_col_to_logical_col(text: &str, visual_col: usize) -> usize {
     let mut logical_col_of = vec![0usize; graphemes.len()];
     let mut lc = 0usize;
     for (gi, g) in graphemes.iter().enumerate() {
-        logical_col_of[gi] = lc;
+        if let Some(slot) = logical_col_of.get_mut(gi) {
+            *slot = lc;
+        }
         lc += UnicodeWidthStr::width(*g);
     }
     let mut vcol = 0usize;
     for &gi in &order {
-        let w = UnicodeWidthStr::width(graphemes[gi]);
+        let Some(g) = graphemes.get(gi) else {
+            continue;
+        };
+        let w = UnicodeWidthStr::width(*g);
         if w == 0 {
             continue;
         }
         if body_vis < vcol + w {
-            return prefix_cols + logical_col_of[gi];
+            return prefix_cols
+                + match logical_col_of.get(gi) {
+                    Some(&c) => c,
+                    None => 0,
+                };
         }
         vcol += w;
     }
@@ -335,12 +358,17 @@ pub fn logical_cols_to_visual(
         return vec![(logical_start, logical_end)];
     }
     let prefix = chrome_prefix_len(text);
-    let prefix_cols = str_cells(&text[..prefix]);
+    let Some(head) = text.get(..prefix) else {
+        return vec![(logical_start, logical_end)];
+    };
+    let prefix_cols = str_cells(head);
     if logical_end <= prefix_cols {
         return vec![(logical_start, logical_end)];
     }
 
-    let body = &text[prefix..];
+    let Some(body) = text.get(prefix..) else {
+        return vec![(logical_start, logical_end)];
+    };
     if !needs_bidi(body) {
         return vec![(logical_start, logical_end)];
     }
@@ -387,19 +415,17 @@ fn is_table_row(text: &str) -> bool {
 }
 
 fn chrome_prefix_len(text: &str) -> usize {
-    // Peel nested chrome tiers: a blockquote bar can be followed by a list
-    // marker (`│ • …`, `│ 1. …`). Paint reorders the full line, so if only the
-    // bar were peeled the marker would join the reordered body and move under
-    // RTL — and the marker-only region map would then disagree with paint. Peel
-    // the bar, then a single marker on the remainder, so both stay left-anchored
-    // and the region map matches the painted body.
+    // Peel the blockquote bar, then a single list marker on the remainder (`│ • …`, `│ 1. …`), so both stay left-anchored.
+    // If only the bar were peeled, the marker would join the reordered body and move under RTL, and the region map would disagree with paint
     let bq = blockquote_prefix_len(text);
-    bq + marker_prefix_len(&text[bq..])
+    match text.get(bq..) {
+        Some(rest) => bq + marker_prefix_len(rest),
+        None => bq,
+    }
 }
 
 fn marker_prefix_len(text: &str) -> usize {
-    // `\u{25C8} ` / `\u{2666} ` are the group-header diamond (see
-    // `group_header_chrome_prefix`); keep it left-anchored like other markers.
+    // `\u{25C8} ` / `\u{2666} ` are the group-header diamond (see `group_header_chrome_prefix`); keep it left-anchored like other markers
     for prefix in [
         "$ ",
         "\u{276F} ",
@@ -419,10 +445,14 @@ fn marker_prefix_len(text: &str) -> usize {
     {
         let bytes = text.as_bytes();
         let mut i = 0usize;
-        while i < bytes.len() && bytes[i].is_ascii_digit() {
+        while i < bytes.len() && bytes.get(i).is_some_and(|b| b.is_ascii_digit()) {
             i += 1;
         }
-        if i > 0 && i + 1 < bytes.len() && bytes[i] == b'.' && bytes[i + 1] == b' ' {
+        if i > 0
+            && i + 1 < bytes.len()
+            && bytes.get(i) == Some(&b'.')
+            && bytes.get(i + 1) == Some(&b' ')
+        {
             return i + 2;
         }
     }
@@ -454,8 +484,13 @@ fn reorder_body(body: &str, level: Level) -> String {
     for para in &bidi.paragraphs {
         let (levels, runs) = bidi.visual_runs(para, para.range.clone());
         for run in runs {
-            let slice = &body[run.clone()];
-            if levels[run.start].is_rtl() {
+            let Some(slice) = body.get(run.clone()) else {
+                continue;
+            };
+            let Some(level) = levels.get(run.start) else {
+                continue;
+            };
+            if level.is_rtl() {
                 for g in slice.graphemes(true).collect::<Vec<_>>().into_iter().rev() {
                     out.push_str(&mirror_grapheme(g));
                 }
@@ -478,9 +513,14 @@ fn append_reordered_body(
     for para in &bidi.paragraphs {
         let (levels, runs) = bidi.visual_runs(para, para.range.clone());
         for run in runs {
-            let slice = &body[run.clone()];
+            let Some(slice) = body.get(run.clone()) else {
+                continue;
+            };
             let abs = body_byte_base + run.start;
-            let rtl = levels[run.start].is_rtl();
+            let Some(level) = levels.get(run.start) else {
+                continue;
+            };
+            let rtl = level.is_rtl();
             append_graphemes_styled(slice, abs, span_bounds, out, rtl);
         }
     }
@@ -536,7 +576,10 @@ fn style_at(byte: usize, span_bounds: &[(Range<usize>, Style)]) -> Style {
             std::cmp::Ordering::Equal
         }
     }) {
-        Ok(i) => span_bounds[i].1,
+        Ok(i) => match span_bounds.get(i) {
+            Some((_, style)) => *style,
+            None => Style::default(),
+        },
         Err(_) => Style::default(),
     }
 }
@@ -560,7 +603,7 @@ fn visual_grapheme_order(body: &str, level: Level) -> Vec<usize> {
                 .filter(|(_, b)| **b >= run.start && **b < run.end)
                 .map(|(i, _)| i)
                 .collect();
-            if levels[run.start].is_rtl() {
+            if levels.get(run.start).is_some_and(|level| level.is_rtl()) {
                 idxs.reverse();
             }
             order.extend(idxs);
@@ -587,7 +630,9 @@ fn body_logical_cols_to_visual(
     let mut selected = Vec::new();
     let mut vcol = 0usize;
     for &gi in &order {
-        let (lc, width) = logical_meta[gi];
+        let Some(&(lc, width)) = logical_meta.get(gi) else {
+            continue;
+        };
         if width > 0 && lc < logical_end && lc + width > logical_start {
             selected.push((vcol, vcol + width));
         }
@@ -616,9 +661,8 @@ fn slice_display_cols(text: &str, start: usize, end: usize) -> String {
     out
 }
 
-/// Painted cell width: sum of per-grapheme widths, matching what the renderer
-/// draws and the rest of the column math (a width-collapsed cluster such as a
-/// ZWJ emoji occupies its cluster width, not the sum of its code points').
+/// Painted cell width: sum of per-grapheme widths, matching what the renderer draws and the rest of the column math.
+/// A width-collapsed cluster such as a ZWJ emoji occupies its cluster width, not the sum of its code points'.
 fn str_cells(s: &str) -> usize {
     s.graphemes(true).map(UnicodeWidthStr::width).sum()
 }
@@ -629,8 +673,13 @@ fn merge_adjacent_ranges(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)>
     }
     ranges.sort_by_key(|(s, _)| *s);
     let mut merged = Vec::with_capacity(ranges.len());
-    let (mut cs, mut ce) = ranges[0];
-    for &(s, e) in &ranges[1..] {
+    let Some(&(mut cs, mut ce)) = ranges.first() else {
+        return ranges;
+    };
+    let Some(rest) = ranges.get(1..) else {
+        return ranges;
+    };
+    for &(s, e) in rest {
         if s <= ce {
             ce = ce.max(e);
         } else {
@@ -668,8 +717,7 @@ mod tests {
 
     fn with_enabled<R>(f: impl FnOnce() -> R) -> R {
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Restore on scope exit even if `f` panics, so a failed assertion can't
-        // leak the enabled latch into the other serialized bidi tests.
+        // Restore on scope exit even if `f` panics, so a failed assertion can't leak the enabled latch into the other serialized bidi tests
         let _latch = EnabledGuard(is_enabled());
         set_enabled(true);
         f()
@@ -715,7 +763,7 @@ mod tests {
     #[test]
     fn combining_mark_stays_with_base() {
         with_enabled(|| {
-            let s = "ب\u{064E}"; // beh + fatha
+            let s = "ب\u{064E}"; // beh with a combining fatha
             let v = visual_text(s);
             assert_eq!(v.as_ref(), s);
             assert!(v.as_ref().contains('\u{064E}'));
@@ -725,7 +773,6 @@ mod tests {
     #[test]
     fn mirrors_parens_inside_rtl_run() {
         with_enabled(|| {
-            // ا(سلام)ب → reverse RTL run with L4 mirroring → ب(مالس)ا
             let s = format!("ا({AR})ب");
             assert_eq!(visual_text(&s).as_ref(), format!("ب({AR_V})ا"));
         });
@@ -736,7 +783,7 @@ mod tests {
         with_enabled(|| {
             let s = format!("\u{202E}{AR}");
             assert!(!visual_text(&s).contains('\u{202E}'));
-            // RLO + Latin only: still strip the control.
+            // An RLO before pure Latin is still stripped
             assert_eq!(visual_text("\u{202E}Hello").as_ref(), "Hello");
         });
     }
@@ -769,8 +816,7 @@ mod tests {
             let row2 = format!("hello {FA}");
             let auto = visual_text_with_level(&row2, paragraph_level(&row2));
             let forced = visual_text_with_level(&row2, shared);
-            // Auto base is LTR (leading English); shared base follows the
-            // Arabic-first paragraph (RTL), so the Latin/RTL layout differs.
+            // Auto base is LTR (leading English); shared base follows the Arabic-first paragraph (RTL), so the Latin/RTL layout differs
             assert_eq!(auto, format!("hello {FA_V}"));
             assert_ne!(auto, forced);
             assert!(forced.contains(FA_V));
@@ -791,12 +837,12 @@ mod tests {
     #[test]
     fn logical_cols_map_to_visual_cells() {
         with_enabled(|| {
-            // "Hi سلام": logical cols 3..7 are the Arabic run → visual 3..7.
+            // Logical cols 3..7 are the Arabic run
             let mixed = format!("Hi {AR}");
             assert_eq!(logical_cols_to_visual(&mixed, 3, 7), vec![(3, 7)]);
             // Full pure RTL: logical 0..4 maps to the same visual span (reversed glyphs).
             assert_eq!(logical_cols_to_visual(AR, 0, 4), vec![(0, 4)]);
-            // Single logical letter at start of AR → rightmost visual cell.
+            // The single logical letter at the start of AR lands in the rightmost visual cell
             assert_eq!(logical_cols_to_visual(AR, 0, 1), vec![(3, 4)]);
         });
     }
@@ -810,7 +856,10 @@ mod tests {
             let visual = visual_line(&line).expect("reorder");
             let flat: String = visual.spans.iter().map(|s| s.content.to_string()).collect();
             assert_eq!(flat, format!("Hi {AR_V}"));
-            assert_eq!(visual.spans[0].style.fg, Some(Color::Red));
+            let Some(span) = visual.spans.first() else {
+                panic!("expected a span: {:?}", visual.spans);
+            };
+            assert_eq!(span.style.fg, Some(Color::Red));
         });
     }
 
@@ -825,9 +874,14 @@ mod tests {
             // Map the Arabic logical span; painted cells at those visual cols match AR_V.
             let ranges = logical_cols_to_visual(&logical, 3, 7);
             assert_eq!(ranges, vec![(3, 7)]);
-            let (vs, ve) = ranges[0];
+            let Some(&(vs, ve)) = ranges.first() else {
+                panic!("expected a visual range: {ranges:?}");
+            };
             let painted_chars: Vec<char> = painted.chars().collect();
-            let cell_slice: String = painted_chars[vs..ve].iter().collect();
+            let cell_slice: String = match painted_chars.get(vs..ve) {
+                Some(slice) => slice.iter().collect(),
+                None => panic!("visual range {vs}..{ve} out of painted cells"),
+            };
             assert_eq!(cell_slice, AR_V);
 
             // Drag over visual Arabic cells copies logical Arabic.
@@ -838,9 +892,8 @@ mod tests {
     #[test]
     fn keeps_zwnj() {
         with_enabled(|| {
-            // ZWNJ must survive the strip and travel with its cluster; each
-            // joiner clusters with its preceding letter, so reorder reverses
-            // beh+ZWNJ, jeem+ZWNJ, dal into dal, jeem+ZWNJ, beh+ZWNJ.
+            // ZWNJ must survive the strip and travel with its cluster
+            // Each joiner clusters with its preceding letter, so the reorder reverses beh+ZWNJ, jeem+ZWNJ, dal into dal, jeem+ZWNJ, beh+ZWNJ
             let with_zwnj = "ب\u{200C}ج\u{200C}د";
             assert_eq!(visual_text(with_zwnj).as_ref(), "دج\u{200C}ب\u{200C}");
         });
@@ -865,9 +918,8 @@ mod tests {
     #[test]
     fn nested_quote_and_list_marker_stay_left() {
         with_enabled(|| {
-            // Blockquote bar + list marker are both chrome: only the body
-            // reorders, so paint keeps `│ • ` / `│ 1. ` left-anchored and the
-            // column maps (which drop the quote prefix) agree with the body.
+            // The blockquote bar and the list marker are both chrome: only the body reorders
+            // Paint keeps `│ • ` / `│ 1. ` left-anchored, and the column maps (which drop the quote prefix) agree with the body.
             assert_eq!(
                 visual_text(&format!("│ • {FA}")).as_ref(),
                 format!("│ • {FA_V}")
@@ -876,8 +928,7 @@ mod tests {
                 visual_text(&format!("│ 1. {FA}")).as_ref(),
                 format!("│ 1. {FA_V}")
             );
-            // Paint matches, and dropping the quote prefix (the selectable
-            // region) still peels the marker so the body reorder is identical.
+            // Paint matches, and dropping the quote prefix (the selectable region) still peels the marker so the body reorder is identical
             assert_eq!(paint_plain(&format!("│ • {FA}"), 20), format!("│ • {FA_V}"));
             assert_eq!(
                 visual_text(&format!("• {FA}")).as_ref(),
@@ -889,9 +940,8 @@ mod tests {
     #[test]
     fn control_prefixed_table_row_maps_identity() {
         with_enabled(|| {
-            // A leading bidi control must not flip the table classification:
-            // paint strips first and leaves the table logical, so the column
-            // maps must classify on the stripped string and stay identity.
+            // A leading bidi control must not flip the table classification
+            // Paint strips first and leaves the table logical, so the column maps must classify on the stripped string and stay identity
             let row = "\u{200F}| x | بت |";
             assert_eq!(visual_col_to_logical_col(row, 4), 4);
             assert_eq!(logical_cols_to_visual(row, 2, 6), vec![(2, 6)]);

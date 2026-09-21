@@ -64,6 +64,8 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
     let tool_context = ToolContext::new(cwd.clone(), None, None, fs, terminal, hunk_tracker_handle);
     let state = TokioMutex::new(State {
         running_task: None,
+        finalization_gate: Default::default(),
+        message_delivery: Default::default(),
         pending_inputs: VecDeque::new(),
         edit_holds: HashMap::new(),
         pending_notifications: Vec::new(),
@@ -75,6 +77,7 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
     });
     let (event_tx, event_rx) = mpsc::unbounded_channel::<SessionEvent>();
     let actor = SessionActor {
+        vcs_root: None,
         transient_retry_enabled: true,
         transient_retries_prompt_total: std::cell::Cell::new(0),
         transient_episode_start: std::cell::Cell::new(None),
@@ -94,6 +97,7 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
             gateway_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             persistence_tx,
             disk_full: crate::session::notifications::idle_disk_full_rx(),
+            client_caps: crate::session::notifications::SessionClientCaps::new(false, true),
         },
         permissions: PermissionHandle::allow_all(),
         tool_context,
@@ -105,6 +109,7 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
         chat_state_handle: xai_chat_state::ChatStateHandle::noop(),
         unattributed_background_usage: std::sync::atomic::AtomicBool::new(false),
         current_prompt_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        active_work: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_interactions: std::sync::Arc::new(std::sync::Mutex::new(
             std::collections::HashMap::new(),
         )),
@@ -135,8 +140,18 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
             cancel: Default::default(),
         },
         memory: crate::session::memory_state::SessionMemory {
+            configured_mode: None,
+            v2_config: Default::default(),
+            configured_storage: None,
+            process_disabled: false,
+            config_opt_out: false,
+            v2_legacy_carryover: false,
+            prompt_sync_pending: std::sync::atomic::AtomicBool::new(false),
             flush_config: crate::config::MemoryFlushConfig::default(),
-            is_flushing: std::sync::atomic::AtomicBool::new(false),
+            is_flushing: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            capture_worker: std::cell::RefCell::new(None),
+            dream_workers: crate::session::memory_state::V2DreamWorkers::default(),
+            last_capture_failure: std::cell::RefCell::new(None),
             last_flush_compaction: std::sync::atomic::AtomicU64::new(0),
             storage: std::cell::RefCell::new(None),
             save_on_end: true,
@@ -151,13 +166,16 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
             injection_count: std::sync::atomic::AtomicU64::new(0),
             compaction_recovery_count: std::sync::atomic::AtomicU64::new(0),
             chunks_added: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            init_reindex_handle: std::cell::RefCell::new(None),
             dream_config: Default::default(),
             dream_count: std::sync::atomic::AtomicU64::new(0),
             dream_success_count: std::sync::atomic::AtomicU64::new(0),
             dream_error_count: std::sync::atomic::AtomicU64::new(0),
+            token_totals: Default::default(),
         },
         session_start: std::time::Instant::now(),
         inference_idle_timeout: Duration::from_secs(300),
+        uncharged_401_park_enabled: true,
         max_retries: 3,
         rate_limit_waits: crate::session::acp_session::RateLimitWaitConfig::default(),
         max_turns: None,
@@ -185,6 +203,7 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
         display_cwd: std::sync::OnceLock::new(),
         active_agent_type: parking_lot::Mutex::new(None),
         queue_exit_reminder_on_approved_exit: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        emit_local_background_tasks: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         active_skill: parking_lot::Mutex::new(None),
         current_prompt_mode: Arc::new(parking_lot::Mutex::new(PromptMode::Agent)),
         turn_start_prompt_mode: parking_lot::Mutex::new(PromptMode::Agent),
@@ -213,6 +232,7 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
         goal_classifier_enabled: false,
         goal_planner_enabled: false,
         goal_summary_enabled: false,
+        length_salvage_remote_budget: None,
         goal_verifier_skeptic_count: 1,
         goal_role_models: Default::default(),
         goal_use_current_model_only: false,
@@ -229,29 +249,34 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
         mcp_reminder_mode: McpReminderMode::Delta,
         mcp_reminder_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         mcp_connecting_reminder_injected: std::cell::Cell::new(false),
-        mcp_handshakes_done: Arc::new(tokio::sync::Notify::new()),
+        mcp_refresh_gate: Arc::new(tokio::sync::Mutex::new(())),
         user_input_generation: std::sync::atomic::AtomicU64::new(0),
         laziness_debug_log: None,
         last_live_orphan_reconcile: std::cell::Cell::new(None),
-        deferred_prefix: TaskSlot::new(),
+        deferred_prefix: DeferredPrefix::new(),
+        mcp_startup_waits: Default::default(),
+        mcp_init_tasks: Default::default(),
+        weak_self: std::sync::Weak::new(),
+        startup_tasks: Default::default(),
         extension_registry: xai_agent_lifecycle::LocalExtensionRegistry::default(),
         last_announced_local_date: std::cell::Cell::new(chrono::Local::now().date_naive()),
         prefix_carries_fallback_date: std::cell::Cell::new(false),
         last_search_prompt_index: std::sync::atomic::AtomicI64::new(-1),
         last_api_request_at: std::sync::atomic::AtomicI64::new(0),
         hook_registry: std::cell::RefCell::new(None),
+        hook_disabled: Default::default(),
         turn_report: Default::default(),
         turn_abort: Default::default(),
         turn_end_tx: Default::default(),
         client_hooks: Default::default(),
         hook_resolved_workspace_root: String::new(),
-        vcs_kind: xai_grok_workspace::session::git::VcsKind::Git,
         hook_load_errors: std::cell::RefCell::new(Vec::new()),
         plugin_registry: std::cell::RefCell::new(None),
         plugin_registry_handle: None,
         events: crate::session::events::EventTracker::new(std::path::Path::new("/tmp")),
         observability_bridge: noop_observability_bridge(),
         current_turn_number: std::cell::Cell::new(0),
+        turn_phases: std::sync::Arc::default(),
         last_recap_main_turn: std::cell::Cell::new(0),
         recap_in_flight: std::cell::Cell::new(false),
         recap_epoch: std::cell::Cell::new(0),
@@ -264,6 +289,8 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
         title_refresh_enabled: false,
         session_turn_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         streaming_turn_capture: parking_lot::Mutex::new(StreamingTurnCapture::default()),
+        stream_apply_span: parking_lot::Mutex::new(None),
+        current_turn_span_id: parking_lot::Mutex::new(None),
         turn_stream_drained: parking_lot::Mutex::new(std::collections::HashMap::new()),
         pending_image_strip: parking_lot::Mutex::new(HashMap::new()),
         image_strip_rewrite_barrier: ImageStripRewriteBarrier::new(),
@@ -319,7 +346,10 @@ async fn send_update_buffers_streaming_chunks_and_flush_sends_merged_notificatio
             tokio::task::yield_now().await;
             let sent_msgs = sent.lock().await.clone();
             assert_eq!(sent_msgs.len(), 1);
-            assert_eq!(extract_text(&sent_msgs[0]).as_deref(), Some("hello"));
+            let Some(first) = sent_msgs.first() else {
+                panic!("expected one sent message: {sent_msgs:?}");
+            };
+            assert_eq!(extract_text(first).as_deref(), Some("hello"));
             let mut persisted = vec![];
             while let Ok(msg) = persistence_rx.try_recv() {
                 persisted.push(msg);
@@ -332,17 +362,9 @@ async fn send_update_buffers_streaming_chunks_and_flush_sends_merged_notificatio
         })
         .await;
 }
-/// Regression for the cancel-during-long-reasoning trace upload gap:
-/// the `SessionCommand::Cancel` and `SessionCommand::CopyFile` handlers
-/// in `run_session` must flush the actor-owned `ReplayBuffer` so streamed
-/// chunks (notably `AgentThoughtChunk` reasoning) still pending at cancel
-/// time are persisted to `updates.jsonl` before `mvp_agent` issues
-/// `CopyFile` to snapshot the session directory for the trace upload.
-///
-/// Without the flush, the tail of a long reasoning stream sitting in the
-/// buffer when the user hits Ctrl+C never reaches disk before
-/// `copy_session_dir_to_memory` reads `updates.jsonl`. This test
-/// exercises the exact code added to both match arms.
+/// Regression test: a cancel during a long reasoning stream must not lose buffered chunks from the trace upload.
+/// The `SessionCommand::Cancel` and `SessionCommand::CopyFile` handlers in `run_session` must flush the actor-owned `ReplayBuffer`.
+/// Without the flush, the tail of a long reasoning stream sitting in the buffer at Ctrl+C never reaches disk.
 #[tokio::test(flavor = "current_thread")]
 async fn cancel_and_copyfile_handlers_flush_buffered_chunks_to_persistence() {
     let local = tokio::task::LocalSet::new();
@@ -397,9 +419,8 @@ async fn cancel_and_copyfile_handlers_flush_buffered_chunks_to_persistence() {
         })
         .await;
 }
-/// Negative control for `cancel_and_copyfile_handlers_flush_buffered_chunks_to_persistence`:
-/// without the flush, a buffered chunk does NOT reach persistence on its
-/// own — proving the flush call is load-bearing in the cancel path.
+/// Negative control for `cancel_and_copyfile_handlers_flush_buffered_chunks_to_persistence`.
+/// Without the flush, a buffered chunk does not reach persistence on its own, so the cancel path needs the explicit flush call.
 #[tokio::test(flavor = "current_thread")]
 async fn buffered_chunk_does_not_reach_persistence_without_explicit_flush() {
     let local = tokio::task::LocalSet::new();
@@ -490,7 +511,7 @@ async fn available_commands_update_is_forwarded_but_not_persisted() {
                 "exactly one update must be persisted; available_commands_update must be skipped",
             );
             assert!(
-                matches!(persisted[0].update, acp::SessionUpdate::AgentMessageChunk(_)),
+                matches!(persisted.first(), Some(n) if matches!(n.update, acp::SessionUpdate::AgentMessageChunk(_))),
                 "the persisted update must be the agent message, not available_commands_update",
             );
             drop(actor);

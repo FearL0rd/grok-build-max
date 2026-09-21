@@ -1,8 +1,7 @@
 //! ACP extension handlers for bundled subagent cache sync and status.
 //!
-//! These endpoints operate on the on-disk bundled cache only. Sync updates the
-//! cache for future agent construction / future conversations; it does not live
-//! reload the currently running `MvpAgent` instance.
+//! These endpoints operate on the on-disk bundled cache only.
+//! Sync updates the cache for future agent construction / future conversations; it does not live reload the running `MvpAgent` instance.
 use super::{ExtResult, parse_params, to_ext_response};
 use crate::agent::MvpAgent;
 use crate::bundle::{self, BundleManifest};
@@ -17,25 +16,15 @@ use xai_grok_tools::implementations::skills::discovery::extract_first_paragraph;
 pub(crate) const BUNDLE_SYNC_TTL: Duration = Duration::from_secs(60 * 60);
 /// Error message returned when no auth source is available for a bundle sync.
 ///
-/// Hoisted to a constant so the user-facing wording stays in lockstep
-/// across `sync_bundle`, `sync_bundle_to_root`, and any future call sites.
+/// Hoisted to a constant so the user-facing wording stays identical across `sync_bundle`, `sync_bundle_to_root`, and any future call sites.
 pub(crate) const NO_BUNDLE_CREDENTIALS_ERROR: &str =
     "bundle sync requires either an authenticated cli-chat-proxy session or a deployment key";
-/// Whether the caller has any source of authentication that the
-/// cli-chat-proxy `/v1/subagents/bundle` endpoint will accept.
-///
-/// Centralised so the auth gate predicate stays consistent across:
-/// - `sync_bundle` (user-triggered ACP entrypoint)
-/// - `sync_bundle_to_root` (defense-in-depth on the public function)
-/// - `maybe_sync_bundle_to_root` (proactive wrapper, silent skip on miss)
-/// - `MvpAgent::maybe_sync_bundle_in_background` (post-auth pre-spawn gate)
-///
-/// All four call sites previously inlined the same predicate; a future
-/// auth-source addition (e.g., service-account token) only needs to land
-/// here.
+/// Whether the caller has any source of authentication that the cli-chat-proxy `/v1/subagents/bundle` endpoint will accept.
+/// Centralised so the auth gate predicate stays consistent across: `sync_bundle` (user-triggered ACP entrypoint) `sync_bundle_to_root` (defense-in-depth on the public function) `maybe_sync_bundle_to_root` (proactive wrapper, silent skip on miss) `MvpAgent::maybe_sync_bundle_in_background` (post-auth pre-spawn gate)
+/// All four call sites previously inlined the same predicate; a future auth-source addition (e.g., service-account token) only needs to land here.
 #[inline]
 pub(crate) fn has_bundle_credentials(
-    auth_manager: Option<&std::sync::Arc<crate::auth::AuthManager>>,
+    auth_manager: Option<&std::sync::Arc<xai_grok_login::AuthManager>>,
     deployment_key: Option<&str>,
 ) -> bool {
     auth_manager
@@ -136,16 +125,9 @@ async fn sync_bundle(agent: &MvpAgent, req: BundleSyncRequest) -> anyhow::Result
     )
     .await
 }
-/// `true` when `<root>/manifest.json` exists, was written within `ttl`, and
-/// is parseable as a [`BundleManifest`].
-///
-/// The parse check guards against the silent-skip failure mode where the
-/// mtime is recent (e.g., a partial/aborted write) but the manifest is
-/// truncated or otherwise corrupt. A bare mtime check would let
-/// `maybe_sync_bundle_to_root` proactively skip a re-sync, leaving callers
-/// (`status_bundle_at`, `SubagentsConfig::resolve`) to fail later with an
-/// empty or stale catalog. Treating an unparseable manifest as "not fresh"
-/// forces a re-sync on the next post-auth event.
+/// `true` when `<root>/manifest.json` exists, was written within `ttl`, and is parseable as a [`BundleManifest`].
+/// The parse check guards against a silent skip: the mtime is recent (e.g., a partial/aborted write) but the manifest is truncated or corrupt.
+/// A bare mtime check would let `maybe_sync_bundle_to_root` proactively skip a re-sync. Callers (`status_bundle_at`, `SubagentsConfig::resolve`) would then fail later with an empty or stale catalog. Treating an unparseable manifest as "not fresh" forces a re-sync on the next post-auth event.
 pub(crate) fn bundle_cache_is_fresh(root: &Path, ttl: Duration) -> bool {
     let manifest = root.join("manifest.json");
     let Ok(meta) = std::fs::metadata(&manifest) else {
@@ -163,17 +145,13 @@ pub(crate) fn bundle_cache_is_fresh(root: &Path, ttl: Duration) -> bool {
     }
     matches!(bundle::read_cached_manifest(root), Ok(Some(_)))
 }
-/// Proactive variant of [`sync_bundle_to_root`] that respects an auth gate
-/// and a TTL guard.
-///
-/// Returns:
-/// - `Ok(Some(result))` when a sync was performed.
-/// - `Ok(None)` when the call was skipped (no credentials or cache fresh).
-/// - `Err(_)` when sync was attempted but the network call or extract failed.
+/// Proactive variant of [`sync_bundle_to_root`] that respects an auth gate and a TTL guard.
+/// `Ok(None)` when the call was skipped (no credentials or cache fresh).
+/// `Err(_)` when sync was attempted but the network call or extract failed.
 pub(crate) async fn maybe_sync_bundle_to_root(
     root: &Path,
     proxy_base_url: &str,
-    auth_manager: Option<&std::sync::Arc<crate::auth::AuthManager>>,
+    auth_manager: Option<&std::sync::Arc<xai_grok_login::AuthManager>>,
     deployment_key: Option<&str>,
     alpha_test_key: Option<&str>,
     force: bool,
@@ -204,7 +182,7 @@ pub(crate) async fn maybe_sync_bundle_to_root(
 pub(crate) async fn sync_bundle_to_root(
     root: &Path,
     proxy_base_url: &str,
-    auth_manager: Option<&std::sync::Arc<crate::auth::AuthManager>>,
+    auth_manager: Option<&std::sync::Arc<xai_grok_login::AuthManager>>,
     deployment_key: Option<&str>,
     alpha_test_key: Option<&str>,
     _force: bool,
@@ -430,7 +408,6 @@ mod tests {
         routing::get,
     };
     use prod_mc_cli_chat_proxy_types::SubagentBundle;
-    use serial_test::serial;
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
     fn sample_bundle() -> SubagentBundle {
@@ -463,10 +440,10 @@ mod tests {
             .insert("review".to_string(), "# Review skill\n".to_string());
         bundle
     }
-    fn test_auth() -> crate::auth::GrokAuth {
-        crate::auth::GrokAuth {
+    fn test_auth() -> xai_grok_login::GrokAuth {
+        xai_grok_login::GrokAuth {
             key: "token".to_string(),
-            auth_mode: crate::auth::AuthMode::Oidc,
+            auth_mode: xai_grok_login::AuthMode::Oidc,
             create_time: chrono::Utc::now(),
             user_id: "user-1".to_string(),
             email: Some("test@example.com".to_string()),
@@ -491,9 +468,10 @@ mod tests {
             oidc_client_id: None,
         }
     }
-    fn test_auth_manager() -> Arc<crate::auth::AuthManager> {
+    fn test_auth_manager() -> Arc<xai_grok_login::AuthManager> {
         let dir = tempfile::tempdir().unwrap();
-        let mgr = crate::auth::AuthManager::new(dir.path(), crate::auth::GrokComConfig::default());
+        let mgr =
+            xai_grok_login::AuthManager::new(dir.path(), xai_grok_login::GrokComConfig::default());
         mgr.hot_swap(test_auth());
         std::mem::forget(dir);
         Arc::new(mgr)
@@ -564,7 +542,6 @@ mod tests {
         (format!("{base}/v1"), seen_headers, handle)
     }
     #[test]
-    #[serial]
     fn status_reports_no_cache_when_manifest_missing() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("bundled");
@@ -584,7 +561,6 @@ mod tests {
         );
     }
     #[test]
-    #[serial]
     fn status_reports_cached_entries_from_manifest_and_disk() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("bundled");
@@ -603,7 +579,6 @@ mod tests {
         assert_eq!(status.skills, Vec::<String>::new());
     }
     #[tokio::test(flavor = "current_thread")]
-    #[serial]
     async fn sync_success_writes_cache_and_returns_counts() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("bundled");
@@ -628,7 +603,6 @@ mod tests {
         server.abort();
     }
     #[tokio::test(flavor = "current_thread")]
-    #[serial]
     async fn sync_force_true_has_same_write_semantics() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("bundled");
@@ -646,7 +620,6 @@ mod tests {
         server.abort();
     }
     #[tokio::test(flavor = "current_thread")]
-    #[serial]
     async fn sync_http_failure_surfaces_error() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("bundled");
@@ -663,7 +636,6 @@ mod tests {
         server.abort();
     }
     #[tokio::test(flavor = "current_thread")]
-    #[serial]
     async fn sync_uses_deployment_key_auth_mode() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("bundled");
@@ -692,7 +664,6 @@ mod tests {
         server.abort();
     }
     #[test]
-    #[serial]
     fn status_only_reports_bundled_cache_not_higher_priority_sources() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("bundled");
@@ -739,7 +710,6 @@ mod tests {
         assert_eq!(status.skills, Vec::<String>::new());
     }
     #[test]
-    #[serial]
     fn sync_requires_auth_or_deployment_key() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("bundled");
@@ -757,7 +727,6 @@ mod tests {
             .contains("bundle sync requires either an authenticated cli-chat-proxy session or a deployment key"));
     }
     #[test]
-    #[serial]
     fn get_entry_reads_persona_file() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("bundled");
@@ -768,7 +737,6 @@ mod tests {
         assert!(result.content.contains("instructions"));
     }
     #[test]
-    #[serial]
     fn get_entry_unknown_kind_returns_error() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("bundled");
@@ -776,7 +744,6 @@ mod tests {
         assert!(err.to_string().contains("unknown entry kind: widget"));
     }
     #[test]
-    #[serial]
     fn get_entry_missing_file_returns_error() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("bundled");
@@ -804,14 +771,15 @@ mod tests {
         assert!(err.to_string().contains("invalid entry name"));
     }
     #[test]
-    #[serial]
     fn status_includes_persona_and_role_details() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("bundled");
         bundle::write_bundle_to_cache(&root, &sample_bundle()).unwrap();
         let status = status_bundle_at(&root).unwrap();
         assert_eq!(status.persona_details.len(), 1);
-        let pd = &status.persona_details[0];
+        let Some(pd) = status.persona_details.first() else {
+            panic!("expected persona details: {status:?}");
+        };
         assert_eq!(pd.name, "researcher");
         assert_eq!(
             pd.description.as_deref(),
@@ -820,12 +788,13 @@ mod tests {
         assert!(pd.has_inputs);
         assert!(pd.has_outputs);
         assert_eq!(status.role_details.len(), 1);
-        let rd = &status.role_details[0];
+        let Some(rd) = status.role_details.first() else {
+            panic!("expected role details: {status:?}");
+        };
         assert_eq!(rd.name, "reviewer");
         assert_eq!(rd.description, "Meticulous code reviewer");
     }
     #[test]
-    #[serial]
     fn status_without_toml_files_returns_empty_details() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("bundled");
@@ -874,7 +843,6 @@ mod tests {
         assert_eq!(detail.description, "");
     }
     #[tokio::test(flavor = "current_thread")]
-    #[serial]
     async fn sync_with_skills_reports_skills_count() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("bundled");
@@ -898,7 +866,6 @@ mod tests {
         server.abort();
     }
     #[test]
-    #[serial]
     fn status_lists_skill_names_from_manifest() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("bundled");
@@ -909,7 +876,6 @@ mod tests {
         assert_eq!(status.personas, vec!["researcher"]);
     }
     #[test]
-    #[serial]
     fn status_skills_only_lists_files_present_on_disk() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("bundled");
@@ -941,7 +907,6 @@ mod tests {
         (format!("{base}/v1"), handle)
     }
     #[tokio::test(flavor = "current_thread")]
-    #[serial]
     async fn sync_with_archive_endpoint_extracts_and_reports_counts() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("bundled");
@@ -975,7 +940,6 @@ mod tests {
         server.abort();
     }
     #[tokio::test(flavor = "current_thread")]
-    #[serial]
     async fn sync_falls_back_to_legacy_when_archive_unavailable() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("bundled");

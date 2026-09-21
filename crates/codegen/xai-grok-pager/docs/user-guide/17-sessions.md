@@ -28,6 +28,9 @@ Grok stores each session in its own directory, grouped by working directory. It 
   summary.json            # metadata: summary/title, timestamps, model ID, message counts
   updates.jsonl           # ACP session update stream (conversation + tool calls)
   chat_history.jsonl      # raw chat messages sent to the model
+  system_prompt.txt       # the rendered system prompt, as sent to the model
+  prompt_context.json     # the inputs the system prompt was rendered from
+  tool_definitions.json   # function tools sent on the latest model call (no MCP server__tool entries)
   plan.json               # TODO/task list state
   rewind_points.jsonl     # rewind points for /rewind undo
   signals.json            # session signals (token usage, tool/turn counters)
@@ -36,7 +39,7 @@ Grok stores each session in its own directory, grouped by working directory. It 
   subagents/              # per-subagent metadata (meta.json); the child sessions live in the normal sessions tree
 ```
 
-`summary.json` is the index entry. It records the session summary and generated title, the model ID, the creation and update timestamps, the message counts, and a parent session reference for forked or restored sessions. It also records the latest last-turn summary and session recap so listing surfaces can show them. `updates.jsonl` is the authoritative conversation log that drives `/resume` and session restore.
+`summary.json` is the index entry. It records the session summary and generated title, the model ID, the creation and update timestamps, the message counts, and a parent session reference for forked or restored sessions. It also records the latest last-turn summary and session recap so listing surfaces can show them. `updates.jsonl` is the authoritative conversation log that drives `/resume` and session restore. `tool_definitions.json` omits MCP `server__tool` entries because the model reaches those through `search_tool` and `use_tool`, which are listed. Per-turn token and cost totals are available through `grok usage`.
 
 ### Session titles
 
@@ -240,9 +243,17 @@ await connection.request("session/load", {
   cwd: "/path/to/project",
   mcpServers: [],
 });
+
+// Change a live option (model or reasoning_effort).
+// session/new and session/load already return the typed configOptions list.
+await connection.request("session/set_config_option", {
+  sessionId,
+  configId: "model",
+  value: { value: "grok-4.6" },
+});
 ```
 
-The agent persists all session updates automatically. Clients can reconnect and load previous sessions by ID.
+The agent persists all session updates automatically. Clients can reconnect and load previous sessions by ID. See [Agent mode](15-agent-mode.md#session-config-options) for the option IDs, value shape, and leader-mode snoop.
 
 ---
 
@@ -262,6 +273,22 @@ grok sessions search "rate limit"
 ```
 
 `grok sessions list` shows sessions for the current working directory, grouped by worktree label. Each row lists the session ID, the creation and update dates, the source status, and the summary. `grok sessions search` combines a local SQLite index with remote results.
+
+---
+
+## The grok usage Subcommand
+
+Print persisted token and cost usage for a session. Use this instead of reading session files:
+
+```bash
+# Session totals plus every recorded turn
+grok usage <session-id>
+
+# One turn
+grok usage <session-id> 3
+```
+
+Output is JSON with `sessionId`, `updatedAt`, `session`, and `turns`. A specific turn uses the same envelope with one element in `turns`. Session totals cover the whole conversation, including history inherited by resume or fork. `costUsdTicks` is 10¹⁰ ticks per USD (divide by `1e10` for dollars). A missing turn number is an error. Interactive credit and billing stay on `/usage` in the TUI.
 
 ---
 

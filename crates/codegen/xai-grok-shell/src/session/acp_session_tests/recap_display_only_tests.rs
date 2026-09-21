@@ -1,9 +1,7 @@
 //! Regression tests for the session-recap display-only invariant.
 //!
-//! A recap must NEVER mutate the model conversation — it is generated from a
-//! read-only snapshot and surfaced as a notification only. These tests lock
-//! that contract: after `handle_recap` returns, `get_conversation()` must be
-//! byte-identical to what it was before.
+//! A recap must NEVER mutate the model conversation: it is generated from a read-only snapshot and sent to the client as a notification only.
+//! These tests lock that contract: after `handle_recap` returns, `get_conversation()` must be byte-identical to what it was before.
 
 use super::support::*;
 use super::*;
@@ -17,7 +15,8 @@ fn main_turn_input(items: Vec<ConversationItem>) -> Vec<serde_json::Value> {
         ..Default::default()
     };
     let mapped = async_openai::types::responses::CreateResponse::from(&request);
-    serde_json::to_value(&mapped).expect("request serializes")["input"]
+    let value = serde_json::to_value(&mapped).expect("request serializes");
+    j(&value, "input")
         .as_array()
         .expect("input is an array")
         .clone()
@@ -30,15 +29,18 @@ fn assert_rides_parent_prefix(
     label: &str,
 ) {
     let expected = main_turn_input(parent);
-    let actual = body["input"].as_array().expect("input must be present");
+    let actual = j(body, "input").as_array().expect("input must be present");
     assert!(
         actual.len() > expected.len(),
         "{label}: auxiliary input ({}) must extend the parent ({})",
         actual.len(),
         expected.len()
     );
+    let Some(prefix) = actual.get(..expected.len()) else {
+        panic!("{label}: actual shorter than parent prefix: {actual:?}");
+    };
     assert_eq!(
-        &actual[..expected.len()],
+        prefix,
         expected.as_slice(),
         "{label}: prefix diverges from the main turn"
     );
@@ -80,8 +82,8 @@ fn assert_messages_rides_parent_prefix(
     };
     let expected = serde_json::to_value(xai_grok_sampling_types::build_messages_request(&request))
         .expect("main Messages request serializes");
-    let expected_messages = without_cache_control(expected["messages"].clone());
-    let actual_messages = without_cache_control(body["messages"].clone());
+    let expected_messages = without_cache_control(j(&expected, "messages").clone());
+    let actual_messages = without_cache_control(j(body, "messages").clone());
     let expected = expected_messages
         .as_array()
         .expect("main Messages request has messages");
@@ -93,8 +95,11 @@ fn assert_messages_rides_parent_prefix(
         actual.len() > expected.len(),
         "{label}: side-call Messages request must extend the parent"
     );
+    let Some(prefix) = actual.get(..expected.len()) else {
+        panic!("{label}: actual shorter than parent prefix: {actual:?}");
+    };
     assert_eq!(
-        &actual[..expected.len()],
+        prefix,
         expected.as_slice(),
         "{label}: Messages prefix diverges from the main turn"
     );
@@ -103,26 +108,34 @@ fn assert_messages_rides_parent_prefix(
         expected.len() + 1,
         "{label}: exactly one instruction message must be appended"
     );
-    assert_eq!(body["thinking"]["type"], "adaptive", "{label}: {body:#}");
-    assert_eq!(body["output_config"]["effort"], "high", "{label}: {body:#}");
+    assert_eq!(
+        j(j(body, "thinking"), "type"),
+        "adaptive",
+        "{label}: {body:#}"
+    );
+    assert_eq!(
+        j(j(body, "output_config"), "effort"),
+        "high",
+        "{label}: {body:#}"
+    );
 }
 
 fn assert_messages_reasoning_stripped(body: &serde_json::Value, label: &str) {
     assert!(
-        body.get("thinking").is_none() || body["thinking"].is_null(),
+        body.get("thinking").is_none() || j(body, "thinking").is_null(),
         "{label}: top-level thinking must be absent: {body:#}"
     );
-    for message in body["messages"]
+    for message in j(body, "messages")
         .as_array()
         .expect("Messages request has messages")
     {
-        let Some(blocks) = message["content"].as_array() else {
+        let Some(blocks) = j(message, "content").as_array() else {
             continue;
         };
         assert!(
             blocks.iter().all(|block| {
                 !matches!(
-                    block["type"].as_str(),
+                    j(block, "type").as_str(),
                     Some("thinking" | "redacted_thinking")
                 )
             }),
@@ -160,7 +173,7 @@ async fn side_question_projects_agent_messages_without_mutating_history() {
             actor.chat_state_handle.replace_conversation(raw);
 
             actor
-                .handle_side_question("what context matters?")
+                .handle_side_question("what context matters?", Vec::new())
                 .await
                 .expect("side question must succeed");
 
@@ -210,7 +223,7 @@ async fn auxiliary_calls_send_the_session_reasoning_effort() {
             ]);
 
             actor
-                .handle_side_question("what does xor mean here?")
+                .handle_side_question("what does xor mean here?", Vec::new())
                 .await
                 .expect("side question must succeed");
 
@@ -222,10 +235,10 @@ async fn auxiliary_calls_send_the_session_reasoning_effort() {
                 .and_then(|r| r.body.as_ref())
                 .expect("btw body must be JSON");
             assert_eq!(
-                body["reasoning"]["effort"].as_str(),
+                j(j(body, "reasoning"), "effort").as_str(),
                 Some("low"),
                 "side question must send the session's effort, not the model default: {}",
-                body["reasoning"]
+                j(body, "reasoning")
             );
         })
         .await;
@@ -259,7 +272,7 @@ async fn side_question_routes_on_the_session_id_when_the_key_is_not_forwarded() 
             ]);
 
             actor
-                .handle_side_question("what does xor mean here?")
+                .handle_side_question("what does xor mean here?", Vec::new())
                 .await
                 .expect("side question must succeed");
 
@@ -310,8 +323,8 @@ async fn new_prompt_cancels_in_flight_recap_epoch() {
         .await;
 }
 
-/// `queue_input` for a real user prompt bumps epoch before any await so a
-/// LocalSet recap cannot commit after Prompt accept but before handle_prompt.
+/// `queue_input` for a real user prompt bumps the epoch before any await.
+/// A LocalSet recap therefore cannot commit after Prompt accept but before handle_prompt.
 #[tokio::test(flavor = "current_thread")]
 async fn queue_input_user_prompt_bumps_recap_epoch() {
     let local = tokio::task::LocalSet::new();
@@ -335,7 +348,7 @@ async fn queue_input_user_prompt_bumps_recap_epoch() {
         .await;
 }
 
-/// Synthetic auto-wake must not cancel an in-flight recap.
+/// A synthetic `queue_input`, sent when a background task completes, must not cancel an in-flight recap.
 #[tokio::test(flavor = "current_thread")]
 async fn queue_input_synthetic_does_not_bump_recap_epoch() {
     let local = tokio::task::LocalSet::new();
@@ -386,7 +399,7 @@ async fn skipped_auto_recap_leaves_in_flight_claim() {
         .await;
 }
 
-/// Production commit branch: epoch bump mid-flight → no watermark, in-flight cleared.
+/// When the epoch bumps mid-flight, `try_commit_recap` advances no watermark and still clears `recap_in_flight`.
 #[tokio::test(flavor = "current_thread")]
 async fn try_commit_recap_cancelled_clears_in_flight_without_watermark() {
     let local = tokio::task::LocalSet::new();
@@ -419,7 +432,7 @@ async fn try_commit_recap_cancelled_clears_in_flight_without_watermark() {
         .await;
 }
 
-/// Live epoch commits watermark and clears in-flight (emit path may proceed).
+/// A live epoch commits the watermark and clears `recap_in_flight`, so the emit path may proceed.
 #[tokio::test(flavor = "current_thread")]
 async fn try_commit_recap_live_advances_watermark() {
     let local = tokio::task::LocalSet::new();
@@ -480,7 +493,7 @@ async fn drop_recap_after_cancel_auto_silent_manual_unavailable() {
         .await;
 }
 
-/// Drain whether a `SessionRecap` update was emitted.
+/// Drain the persistence channel and report whether a `SessionRecap` update was emitted.
 fn drained_session_recap(rx: &mut tokio::sync::mpsc::UnboundedReceiver<PersistenceMsg>) -> bool {
     let mut saw = false;
     while let Ok(msg) = rx.try_recv() {
@@ -535,9 +548,9 @@ async fn auto_recap_below_min_turns_is_noop_and_display_only() {
         .await;
 }
 
-/// A manual `/recap` passes the gate (when a new main turn exists) and attempts
-/// generation; the test's base_url is unreachable so the model call fails.
-/// Either way the conversation must be byte-identical afterwards — display-only.
+/// A manual `/recap` passes the gate (when a new main turn exists) and attempts generation.
+/// The test's base_url is unreachable so the model call fails.
+/// Either way the conversation must be byte-identical afterwards: display-only.
 #[tokio::test(flavor = "current_thread")]
 async fn manual_recap_never_mutates_conversation() {
     let local = tokio::task::LocalSet::new();
@@ -572,8 +585,7 @@ async fn manual_recap_never_mutates_conversation() {
         .await;
 }
 
-/// Drain the persistence channel and report whether a `SessionRecapUnavailable`
-/// xAI update was emitted.
+/// Drain the persistence channel and report whether a `SessionRecapUnavailable` xAI update was emitted.
 fn drained_recap_unavailable(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<PersistenceMsg>,
 ) -> bool {
@@ -591,11 +603,9 @@ fn drained_recap_unavailable(
     saw
 }
 
-/// A manual `/recap` on a brand-new session (no main turns yet) must NOT strand
-/// the client's loading spinner: the recap gate skips before any model call, but
-/// instead of silently dropping, the shell emits `SessionRecapUnavailable` so
-/// the client can clear it. Deterministic (no-network) repro of the
-/// forever-spinner bug.
+/// A manual `/recap` on a brand-new session (no main turns yet) must NOT strand the client's loading spinner.
+/// The gate skips before any model call, but the shell emits `SessionRecapUnavailable` instead of dropping silently, so the client can clear it.
+/// This test reproduces, with no network, the bug where the spinner never cleared.
 #[tokio::test(flavor = "current_thread")]
 async fn manual_recap_with_no_turns_emits_unavailable() {
     let local = tokio::task::LocalSet::new();
@@ -607,7 +617,7 @@ async fn manual_recap_with_no_turns_emits_unavailable() {
                 tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
             let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
 
-            // No main (user) turns — the gate skips before any model call.
+            // No main (user) turns: the gate skips before any model call
             actor.chat_state_handle.replace_conversation(vec![]);
 
             actor.handle_recap(false).await;
@@ -620,9 +630,8 @@ async fn manual_recap_with_no_turns_emits_unavailable() {
         .await;
 }
 
-/// A manual `/recap` whose generation fails (the test's base_url is
-/// unreachable, so the prepare/model call errors) must also emit
-/// `SessionRecapUnavailable` rather than leaving the spinner running.
+/// A manual `/recap` whose generation fails must also emit `SessionRecapUnavailable` rather than leaving the spinner running.
+/// The test's base_url is unreachable, so the prepare/model call errors.
 #[tokio::test(flavor = "current_thread")]
 async fn manual_recap_generation_failure_emits_unavailable() {
     let local = tokio::task::LocalSet::new();
@@ -634,8 +643,7 @@ async fn manual_recap_generation_failure_emits_unavailable() {
                 tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
             let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
 
-            // One main (user) turn clears the recap gate, so the failure comes
-            // from the (unreachable) prepare/model call rather than the gate.
+            // One main (user) turn clears the recap gate, so the failure comes from the (unreachable) prepare/model call rather than the gate
             actor.chat_state_handle.replace_conversation(vec![
                 ConversationItem::system("you are a coding agent"),
                 ConversationItem::user("explain the borrow checker"),
@@ -652,9 +660,8 @@ async fn manual_recap_generation_failure_emits_unavailable() {
         .await;
 }
 
-/// When the recap model call is attempted (gate passes) but fails, we still
-/// persist a `RecapRequest` artifact (with `error` set) for offline replay —
-/// same idea as compaction request artifacts on failure.
+/// When the recap model call is attempted (gate passes) but fails, we still persist a `RecapRequest` artifact (with `error` set) for offline replay.
+/// Compaction persists its request artifacts on failure the same way.
 #[tokio::test(flavor = "current_thread")]
 async fn manual_recap_generation_failure_persists_request_artifact() {
     let local = tokio::task::LocalSet::new();
@@ -706,9 +713,8 @@ async fn manual_recap_generation_failure_persists_request_artifact() {
         .await;
 }
 
-/// An automatic recap below the turn gate stays silent — it shows no spinner,
-/// so it must NOT emit `SessionRecapUnavailable` (which would be wasted wire
-/// traffic and could clear an unrelated manual spinner on another client).
+/// An automatic recap below the turn gate stays silent: it shows no spinner, so it must NOT emit `SessionRecapUnavailable`.
+/// That emit would be wasted wire traffic and could clear an unrelated manual spinner on another client.
 #[tokio::test(flavor = "current_thread")]
 async fn auto_recap_gated_does_not_emit_unavailable() {
     let local = tokio::task::LocalSet::new();
@@ -720,8 +726,7 @@ async fn auto_recap_gated_does_not_emit_unavailable() {
                 tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
             let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
 
-            // One main turn (below the auto min-turns gate): the auto path is
-            // gated and shows no spinner, so it must stay silent.
+            // One main turn (below the auto min-turns gate): the auto path is gated and shows no spinner, so it must stay silent
             actor
                 .chat_state_handle
                 .replace_conversation(vec![ConversationItem::user("hi, nothing yet")]);
@@ -736,9 +741,8 @@ async fn auto_recap_gated_does_not_emit_unavailable() {
         .await;
 }
 
-/// Over-budget recap: the persisted `RecapRequest` is trimmed within budget and
-/// the conversation is left unmutated (display-only). Seeds an oversized item so
-/// the over-budget branch runs deterministically with no network.
+/// Over-budget recap: the persisted `RecapRequest` is trimmed within budget and the conversation is left unmutated (display-only).
+/// The test seeds an oversized item so the over-budget branch runs deterministically with no network.
 #[tokio::test(flavor = "current_thread")]
 async fn manual_recap_over_budget_trims_persisted_request_and_is_display_only() {
     let local = tokio::task::LocalSet::new();
@@ -748,12 +752,11 @@ async fn manual_recap_over_budget_trims_persisted_request_and_is_display_only() 
                 tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
             let (persistence_tx, mut persistence_rx) =
                 tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
-            // window 8_000 => prompt_budget = 8_000 * 85 / 100 - 4_000 = 2_800.
+            // A window of 8_000 gives prompt_budget = 8_000 * 85 / 100 - 4_000 = 2_800
             const PROMPT_BUDGET: u64 = 8_000 * 85 / 100 - 4_000;
             let actor = create_test_actor(0, 8_000, 85, gateway_tx, persistence_tx).await;
 
-            // An oversized real user turn (~40 KB => ~10k est tokens) forces the
-            // over-budget branch regardless of the harness `total_tokens` arg.
+            // An oversized real user turn (~40 KB, about 10k estimated tokens) forces the over-budget branch regardless of the harness `total_tokens` arg
             actor.chat_state_handle.replace_conversation(vec![
                 ConversationItem::system("you are a coding agent"),
                 ConversationItem::user("x".repeat(40_000)),
@@ -770,8 +773,7 @@ async fn manual_recap_over_budget_trims_persisted_request_and_is_display_only() 
                 "an over-budget recap must not mutate the conversation"
             );
 
-            // The model call fails (unreachable base_url) → the error arm persists
-            // the (trimmed) request artifact.
+            // The model call fails (unreachable base_url), so the error arm persists the (trimmed) request artifact
             let mut saw_recap_request = false;
             while let Ok(msg) = persistence_rx.try_recv() {
                 if let PersistenceMsg::RecapRequest(artifact) = msg {
@@ -803,9 +805,8 @@ async fn manual_recap_over_budget_trims_persisted_request_and_is_display_only() 
 }
 
 /// Over-budget recap serializes to a well-formed Anthropic Messages payload:
-/// system preserved, reasoning stripped, no dangling `tool_use`/`tool_result`, no
-/// `tool_result` before the appended instruction. (Messages is the strictest
-/// shape, so it also covers the laxer grok ChatCompletions/Responses shapes.)
+/// system preserved, reasoning stripped, no dangling `tool_use`/`tool_result`, no.
+/// `tool_result` before the appended instruction. (Messages is the strictest.
 #[test]
 fn over_budget_recap_serializes_to_well_formed_messages_request() {
     use crate::session::helpers::session_recap;
@@ -829,9 +830,8 @@ fn over_budget_recap_serializes_to_well_formed_messages_request() {
         arguments: std::sync::Arc::from("{}"),
     };
 
-    // Over-budget (window 8_000) conversation that ENDS in a tool run and carries
-    // reasoning; a valid interior tool pair sits behind a non-tool barrier so it
-    // survives the trim.
+    // An over-budget (window 8_000) conversation that ENDS in a tool run and carries reasoning
+    // A valid interior tool pair sits behind a non-tool barrier so it survives the trim
     let conv = vec![
         ConversationItem::system("you are a coding agent"),
         ConversationItem::user("o".repeat(60_000)), // oldest, dropped by trim
@@ -844,15 +844,14 @@ fn over_budget_recap_serializes_to_well_formed_messages_request() {
         ConversationItem::tool_result("c2", "z".repeat(40_000)),     // trailing run
     ];
 
-    // grok backend => strip_reasoning=false; the over-budget branch strips anyway.
+    // The grok backend sets `strip_reasoning` to false; the over-budget branch strips anyway
     let items = session_recap::budget_recap_items(conv, "system-reminder", false, 8_000);
     let req = ConversationRequest::from_items(items);
     let msg = xai_grok_sampling_types::build_messages_request(&req);
 
     assert!(msg.system.is_some(), "system prompt must be preserved");
 
-    // Flatten every content block across all messages (each message's content is
-    // a `Blocks` vec here).
+    // Flatten every content block across all messages (each message's content is a `Blocks` vec here)
     let all_blocks: Vec<ContentBlock> = msg
         .messages
         .iter()
@@ -862,7 +861,6 @@ fn over_budget_recap_serializes_to_well_formed_messages_request() {
         })
         .collect();
 
-    // Reasoning stripped: no thinking block anywhere.
     assert!(
         !all_blocks
             .iter()
@@ -899,8 +897,7 @@ fn over_budget_recap_serializes_to_well_formed_messages_request() {
     );
 }
 
-/// Recap wire shape: main-turn tools + `prompt_cache_key` = session id, so the
-/// request rides the parent turn's prefix cache instead of cold-prefilling.
+/// The recap sends the main turn's tools and the session id as `prompt_cache_key`, so it rides the parent turn's prefix cache.
 #[tokio::test(flavor = "current_thread")]
 async fn recap_request_rides_parent_prompt_cache() {
     use xai_grok_test_support::MockInferenceServer;
@@ -912,8 +909,7 @@ async fn recap_request_rides_parent_prompt_cache() {
                 tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
             let (persistence_tx, _prx) = tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
             let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
-            // Register a real tool so the "recap sends the main turn's tools"
-            // assertion is non-vacuous.
+            // Register a real tool so the "recap sends the main turn's tools" assertion is non-vacuous
             *actor.agent.borrow_mut() = test_agent_with_goal_tool().await;
 
             let server = MockInferenceServer::start().await.unwrap();
@@ -952,14 +948,14 @@ async fn recap_request_rides_parent_prompt_cache() {
 
             let body = recap_req.body.as_ref().expect("recap body must be JSON");
             assert_eq!(
-                body["prompt_cache_key"].as_str(),
+                j(body, "prompt_cache_key").as_str(),
                 Some(actor.session_info.id.to_string().as_str()),
                 "prompt_cache_key must be the parent session id for sticky routing"
             );
             let main_turn_specs =
                 actor.turn_base_tool_specs(&actor.prepare_tool_definitions().await);
             assert!(!main_turn_specs.is_empty(), "test env must expose tools");
-            let tools = body["tools"].as_array().expect("tools must be present");
+            let tools = j(body, "tools").as_array().expect("tools must be present");
             assert_eq!(
                 tools.len(),
                 main_turn_specs.len(),
@@ -969,8 +965,8 @@ async fn recap_request_rides_parent_prompt_cache() {
         .await;
 }
 
-/// Hosted tools serialize into the token prefix on the Responses path, so a recap in a backend-search session must send the main turn's hosted
-/// tools or its prefix diverges and cold-misses the cache.
+/// Hosted tools serialize into the token prefix on the Responses path.
+/// A recap in a backend-search session must send the main turn's hosted tools or its prefix diverges and misses the cache.
 #[tokio::test(flavor = "current_thread")]
 async fn recap_request_sends_hosted_tools_under_backend_search() {
     use xai_grok_sampling_types::HostedTool;
@@ -1024,12 +1020,12 @@ async fn recap_request_sends_hosted_tools_under_backend_search() {
                 .find(|r| r.path.contains("responses"))
                 .expect("a responses request must be recorded");
             let body = recap_req.body.as_ref().expect("recap body must be JSON");
-            let tools = body["tools"].as_array().expect("tools must be present");
+            let tools = j(body, "tools").as_array().expect("tools must be present");
 
             assert!(
                 tools
                     .iter()
-                    .any(|t| t["type"].as_str() == Some("web_search")),
+                    .any(|t| j(t, "type").as_str() == Some("web_search")),
                 "recap must send the main turn's hosted tools: {tools:?}"
             );
             // Function tools must still match the main turn's specs exactly.
@@ -1038,7 +1034,7 @@ async fn recap_request_sends_hosted_tools_under_backend_search() {
             assert!(!main_turn_specs.is_empty(), "test env must expose tools");
             let function_tools = tools
                 .iter()
-                .filter(|t| t["type"].as_str() == Some("function"))
+                .filter(|t| j(t, "type").as_str() == Some("function"))
                 .count();
             assert_eq!(
                 function_tools,
@@ -1051,10 +1047,9 @@ async fn recap_request_sends_hosted_tools_under_backend_search() {
 
 // ── Turn-summary task lifecycle (bail / abort-and-respawn) ──────────────
 
-/// A queued follow-up promoted before the post-turn respawn fires is already
-/// running; a snapshot taken now would contain its user message. The entry
-/// gate on `current_prompt_id` bails — that turn's completion re-fires. The
-/// gate also stays inert when the feature is off.
+/// A queued follow-up promoted before the post-turn respawn fires is already running; a snapshot taken now would contain its user message.
+/// The entry gate on `current_prompt_id` bails; that turn's completion re-fires.
+/// The gate also stays inert when the feature is off.
 #[tokio::test(flavor = "current_thread")]
 async fn turn_summary_bails_when_newer_turn_already_running() {
     let local = tokio::task::LocalSet::new();
@@ -1098,9 +1093,8 @@ async fn turn_summary_bails_when_newer_turn_already_running() {
         .await;
 }
 
-/// A real user prompt aborts an in-flight summary generation — its result
-/// would describe a conversation the prompt is about to extend. (A newer
-/// completion aborts via `restart_turn_summary` the same way.)
+/// A real user prompt aborts an in-flight summary generation: its result would describe a conversation the prompt is about to extend.
+/// (A newer completion aborts via `restart_turn_summary` the same way.)
 #[tokio::test(flavor = "current_thread")]
 async fn new_prompt_aborts_in_flight_turn_summary() {
     let local = tokio::task::LocalSet::new();
@@ -1126,8 +1120,7 @@ async fn new_prompt_aborts_in_flight_turn_summary() {
         .await;
 }
 
-/// Happy path: a successful side-call persists the summary and broadcasts it
-/// transiently, then clears the task slot.
+/// Happy path: a successful side-call persists the summary and broadcasts it transiently, then clears the task slot.
 #[tokio::test(flavor = "current_thread")]
 async fn turn_summary_generate_persists_and_broadcasts() {
     use xai_grok_test_support::MockInferenceServer;
@@ -1208,7 +1201,7 @@ async fn turn_summary_generate_persists_and_broadcasts() {
                 );
                 let summary = update.get("summary").and_then(|v| v.as_str()).unwrap_or("");
                 assert!(!summary.is_empty(), "broadcast summary must be non-empty");
-                // Transient path must not stamp eventId (reconnect cursor).
+                // The transient path must not stamp eventId, the cursor a reconnect resumes from
                 let meta = value.get("meta");
                 assert!(
                     meta.and_then(|m| m.get("eventId")).is_none(),
@@ -1221,8 +1214,8 @@ async fn turn_summary_generate_persists_and_broadcasts() {
         .await;
 }
 
-/// A recap must serialize the main turn's *effective* hosted tools, so an active per-turn cutoff
-/// reaches the recap's `x_search` entry rather than an unbounded tool.
+/// A recap must serialize the main turn's *effective* hosted tools.
+/// An active per-turn cutoff must reach the recap's `x_search` entry rather than an unbounded tool.
 #[tokio::test(flavor = "current_thread")]
 async fn recap_hosted_tools_reflect_the_active_per_turn_override() {
     use xai_grok_sampling_types::{HostedTool, SearchDateBound, ToolOverrides, XSearchOptions};
@@ -1237,8 +1230,8 @@ async fn recap_hosted_tools_reflect_the_active_per_turn_override() {
             let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
             *actor.agent.borrow_mut() = test_agent_with_goal_tool().await;
 
-            // Backend-search fixture seeded with an *unbounded* x_search (options: None), so any
-            // bound the recap sends can only have come from the per-turn override below.
+            // The backend-search fixture seeds an *unbounded* x_search (options: None)
+            // Any bound the recap sends can only have come from the per-turn override below
             {
                 let mut agent_slot = actor.agent.borrow_mut();
                 let agent = &*agent_slot;
@@ -1255,7 +1248,7 @@ async fn recap_hosted_tools_reflect_the_active_per_turn_override() {
             }
             actor.supports_backend_search.set(true);
 
-            // A per-turn cutoff (toDate only), with no definition seed: the recap must reflect it.
+            // The per-turn override sets a cutoff (toDate only) the tool definition never seeded; the recap must reflect it
             *actor.tool_overrides.borrow_mut() = Some(ToolOverrides {
                 x_search: Some(XSearchOptions {
                     date_bound: Some(
@@ -1287,13 +1280,13 @@ async fn recap_hosted_tools_reflect_the_active_per_turn_override() {
                 .find(|r| r.path.contains("responses"))
                 .expect("a responses request must be recorded");
             let body = recap_req.body.as_ref().expect("recap body must be JSON");
-            let tools = body["tools"].as_array().expect("tools must be present");
+            let tools = j(body, "tools").as_array().expect("tools must be present");
             let x_search = tools
                 .iter()
-                .find(|t| t["type"].as_str() == Some("x_search"))
+                .find(|t| j(t, "type").as_str() == Some("x_search"))
                 .expect("recap must send the x_search hosted tool");
             assert_eq!(
-                x_search["to_date"].as_str(),
+                j(x_search, "to_date").as_str(),
                 Some("2024-03-15"),
                 "recap must serialize the per-turn override's cutoff, not the unbounded seed: {x_search:?}"
             );
@@ -1329,7 +1322,7 @@ async fn side_question_request_rides_parent_prompt_cache() {
             ]);
 
             let answer = actor
-                .handle_side_question("what does xor mean here?")
+                .handle_side_question("what does xor mean here?", Vec::new())
                 .await
                 .expect("side question must succeed against the mock server");
             assert!(!answer.is_empty());
@@ -1355,17 +1348,17 @@ async fn side_question_request_rides_parent_prompt_cache() {
 
             let body = btw_req.body.as_ref().expect("btw body must be JSON");
             assert_eq!(
-                body["prompt_cache_key"].as_str(),
+                j(body, "prompt_cache_key").as_str(),
                 Some(actor.session_info.id.to_string().as_str()),
                 "prompt_cache_key must be the parent session id for sticky routing"
             );
-            let tools = body["tools"].as_array().expect("tools must be present");
+            let tools = j(body, "tools").as_array().expect("tools must be present");
 
             // The fixture registers `update_goal`, so an empty or unrelated tool list cannot pass.
             let sent: Vec<&str> = tools
                 .iter()
-                .filter(|t| t["type"] == "function")
-                .map(|t| t["name"].as_str().unwrap_or_default())
+                .filter(|t| j(t, "type") == "function")
+                .map(|t| j(t, "name").as_str().unwrap_or_default())
                 .collect();
             assert_eq!(
                 sent,
@@ -1398,7 +1391,7 @@ async fn side_question_request_rides_parent_prompt_cache() {
                 "fixture must have backend search off"
             );
             assert!(
-                !tools.iter().any(|t| t["type"] != "function"),
+                !tools.iter().any(|t| j(t, "type") != "function"),
                 "no hosted tools may be added to a side question the main turn would not send: {tools:?}"
             );
         })
@@ -1438,7 +1431,7 @@ async fn auxiliary_calls_keep_the_main_turn_prefix() {
             actor.chat_state_handle.replace_conversation(parent.clone());
 
             actor
-                .handle_side_question("what does xor mean here?")
+                .handle_side_question("what does xor mean here?", Vec::new())
                 .await
                 .expect("side question must succeed");
             let requests = server.requests();
@@ -1514,7 +1507,7 @@ async fn messages_side_calls_preserve_completed_reasoning() {
             actor.chat_state_handle.replace_conversation(parent.clone());
 
             actor
-                .handle_side_question("what matters most?")
+                .handle_side_question("what matters most?", Vec::new())
                 .await
                 .expect("side question must succeed");
             let body = server
@@ -1624,7 +1617,7 @@ async fn messages_side_calls_strip_reasoning_without_supported_thinking_effort()
                 actor.chat_state_handle.replace_conversation(parent);
 
                 actor
-                    .handle_side_question("what matters most?")
+                    .handle_side_question("what matters most?", Vec::new())
                     .await
                     .expect("side question must succeed");
                 let body = server
@@ -1734,7 +1727,7 @@ async fn side_question_trims_reasoning_orphaned_by_mid_turn_truncation() {
             ]);
 
             actor
-                .handle_side_question("what does xor mean here?")
+                .handle_side_question("what does xor mean here?", Vec::new())
                 .await
                 .expect("side question must succeed against the mock server");
 
@@ -1745,11 +1738,11 @@ async fn side_question_trims_reasoning_orphaned_by_mid_turn_truncation() {
                 .find(|r| r.path.contains("responses"))
                 .expect("a responses request must be recorded");
             let body = btw_req.body.as_ref().expect("btw body must be JSON");
-            let input = body["input"].as_array().expect("input must be present");
+            let input = j(body, "input").as_array().expect("input must be present");
 
             let kinds: Vec<&str> = input
                 .iter()
-                .map(|i| i["type"].as_str().unwrap_or("message"))
+                .map(|i| j(i, "type").as_str().unwrap_or("message"))
                 .collect();
             assert!(
                 !kinds.contains(&"reasoning"),
@@ -1763,8 +1756,7 @@ async fn side_question_trims_reasoning_orphaned_by_mid_turn_truncation() {
         .await;
 }
 
-/// Side calls persist text without executing tools, so the shared builder
-/// must pin `Fail` rather than inherit the tool-salvaging default.
+/// Side calls persist text without executing tools, so the shared builder must pin `Fail` rather than inherit the default that salvages tool calls.
 #[tokio::test]
 async fn parent_cached_request_pins_fail_length_policy() {
     let local = tokio::task::LocalSet::new();

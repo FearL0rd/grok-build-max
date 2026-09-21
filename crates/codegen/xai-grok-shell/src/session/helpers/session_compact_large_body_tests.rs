@@ -18,7 +18,7 @@ use xai_chat_state::image_budget::{
 };
 
 const MIB: usize = 1024 * 1024;
-// Mirrors the 50 MiB ingress limit that rejected the incident request.
+// Mirrors the 50 MiB ingress limit that rejected the request during the original incident
 const TRANSPORT_LIMIT_BYTES: usize = 50 * MIB;
 const ENVELOPE_ALLOWANCE_BYTES: usize = MIB;
 const IMAGE_PAYLOAD_BYTES: usize = 9 * MIB;
@@ -227,8 +227,15 @@ async fn responses_large_tool_result_images_fit_transport_limit() {
     assert!(wire.contains("call-0"));
     assert!(wire.contains("call-5"));
     assert!(wire.contains(LARGE_CONTEXT));
-    let tools = body["tools"].as_array().expect("tools must be attached");
-    assert!(tools.iter().any(|tool| tool["name"] == "read_file"));
+    let tools = body
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .expect("tools must be attached");
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool.get("name") == Some(&json!("read_file")))
+    );
     assert_eq!(
         source
             .iter()

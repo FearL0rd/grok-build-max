@@ -5,24 +5,18 @@ use super::*;
 
 fn own_request(actor: &SessionActor, request_id: &xai_grok_sampler::RequestId) {
     let (tx, _rx) = tokio::sync::oneshot::channel();
-    actor
-        .turn_stream_drained
-        .lock()
-        .insert(request_id.clone(), Some(tx));
+    actor.turn_stream_drained.lock().insert(
+        request_id.clone(),
+        crate::session::acp_session::StreamOwnership::with_waiter(Some(tx)),
+    );
 }
 
-// ── StreamingTurnCapture tests ─────────────────────────────────
-//
-// Out-of-band per-turn capture covering "user cancelled mid-reasoning"
-// and "model burned the context window in reasoning tokens" cases.
-// The capture is uploaded as `streaming_partial.json` for trace
-// inspection and is deliberately NOT pushed into `chat_state` so the
-// model never sees the partial on subsequent turns.
+// ── StreamingTurnCapture tests ─────────────────────────────────.
+// The out-of-band per-turn capture covers the "user cancelled mid-reasoning" and "model burned the context window in reasoning tokens" cases.
+// It is deliberately NOT pushed into `chat_state`, so the model never sees the partial on later turns.
 
-/// `handle_sampling_event::ChannelToken` for `Reasoning` and `Text`
-/// channels must accumulate into the session's streaming capture so
-/// the trace upload can serialize it even when the canonical
-/// `record_assistant_response` path is skipped (cancel / max tokens).
+/// `handle_sampling_event::ChannelToken` for the `Reasoning` and `Text` channels must accumulate into the session's streaming capture.
+/// The trace upload can then serialize it even when the canonical `record_assistant_response` path is skipped (cancel / max tokens).
 #[tokio::test(flavor = "current_thread")]
 async fn channel_tokens_accumulate_into_streaming_capture() {
     use xai_grok_sampler::{RequestId, SamplingChannel, SamplingEvent};
@@ -32,8 +26,7 @@ async fn channel_tokens_accumulate_into_streaming_capture() {
             let fixture = make_replay_send_update_fixture().await;
             let actor = Arc::new(fixture.actor);
 
-            // Stamp the prompt id + turn number the way the prompt
-            // handler would have before the sampler starts streaming.
+            // Stamp the prompt id and turn number the way the prompt handler would have before the sampler starts streaming
             *actor
                 .current_prompt_id
                 .lock()
@@ -101,10 +94,8 @@ async fn channel_tokens_accumulate_into_streaming_capture() {
         .await;
 }
 
-/// A same-prompt `StreamStarted` restart (a doomloop retry) must accumulate a
-/// second generation through the real `handle_sampling_event` path rather than
-/// wipe the first — guards the `if cap.prompt_id != prompt_id` branch in the
-/// `StreamStarted` arm that the pure-struct tests bypass.
+/// A same-prompt `StreamStarted` restart (a doomloop retry) must accumulate a second generation rather than wipe the first.
+/// This guards the `if cap.prompt_id != prompt_id` branch in the `StreamStarted` arm, which the pure-struct tests bypass.
 #[tokio::test(flavor = "current_thread")]
 async fn same_prompt_restart_accumulates_segments_via_handler() {
     use xai_grok_sampler::{RequestId, SamplingChannel, SamplingEvent};
@@ -158,7 +149,10 @@ async fn same_prompt_restart_accumulates_segments_via_handler() {
                 1,
                 "the first generation must be folded into segments, not wiped",
             );
-            assert_eq!(cap.segments[0].reasoning_text, "first gen reasoning");
+            assert_eq!(
+                cap.segments.first().map(|s| s.reasoning_text.as_str()),
+                Some("first gen reasoning")
+            );
             assert_eq!(
                 cap.reasoning_text, "second gen reasoning",
                 "the second generation is the in-progress slot",
@@ -168,13 +162,9 @@ async fn same_prompt_restart_accumulates_segments_via_handler() {
         .await;
 }
 
-/// On `SamplingEvent::Completed` the canonical response is committed via
-/// `record_assistant_response`, so its generation is DISCARDED from the
-/// out-of-band capture (the in-progress slot is cleared, not folded into
-/// `segments`) — that reasoning is already in afterStateHistory. Prior
-/// uncommitted same-turn generations (e.g. a doomloop retry that preceded the
-/// commit) are left intact, so a completed turn neither re-uploads its own
-/// reasoning nor erases earlier uncommitted partials.
+/// On `SamplingEvent::Completed` the canonical response is committed via `record_assistant_response`.
+/// Its generation is discarded from the out-of-band capture: the in-progress slot is cleared, not folded into `segments`.
+/// Prior uncommitted same-turn generations are left intact.
 #[tokio::test(flavor = "current_thread")]
 async fn completed_event_clears_slot_keeps_prior_uncommitted_segments() {
     use xai_grok_sampler::{InferenceLatencyStats, RequestId, SamplingChannel, SamplingEvent};
@@ -207,8 +197,7 @@ async fn completed_event_clears_slot_keeps_prior_uncommitted_segments() {
                     chunk_index: 0,
                 })
                 .await;
-            // Same-prompt restart folds the prior generation into `segments` and
-            // opens the in-progress slot for the generation that will commit.
+            // A same-prompt restart folds the prior generation into `segments` and opens the in-progress slot for the generation that will commit
             actor
                 .handle_sampling_event(SamplingEvent::StreamStarted {
                     request_id: req.clone(),
@@ -226,10 +215,10 @@ async fn completed_event_clears_slot_keeps_prior_uncommitted_segments() {
 
             // Completion clears the in-progress slot without wiping the capture.
             let (tx, _rx) = tokio::sync::oneshot::channel::<()>();
-            actor
-                .turn_stream_drained
-                .lock()
-                .insert(req.clone(), Some(tx));
+            actor.turn_stream_drained.lock().insert(
+                req.clone(),
+                crate::session::acp_session::StreamOwnership::with_waiter(Some(tx)),
+            );
             actor
                 .handle_sampling_event(SamplingEvent::Completed {
                     request_id: req,
@@ -256,8 +245,8 @@ async fn completed_event_clears_slot_keeps_prior_uncommitted_segments() {
                 "the prior uncommitted generation must be retained",
             );
             assert_eq!(
-                cap.segments[0].reasoning_text,
-                "prior uncommitted reasoning"
+                cap.segments.first().map(|s| s.reasoning_text.as_str()),
+                Some("prior uncommitted reasoning")
             );
             assert!(
                 cap.reasoning_text.is_empty(),
@@ -267,15 +256,9 @@ async fn completed_event_clears_slot_keeps_prior_uncommitted_segments() {
         .await;
 }
 
-/// Regression: the sampler-event drainer must release the per-turn
-/// stream-drain barrier when (and only when) it processes the terminal
-/// `Completed` event. `run_turn_via_sampler` awaits this barrier before the
-/// turn loop emits the canonical client `ToolCall`s, so every streamed
-/// text/thought chunk's global `eventId` is allocated before the tool call's.
-/// Without it the tool call's `send_update` (run on the turn-loop task) could
-/// interleave between two still-draining text chunks (run on the drainer task)
-/// and split the assistant message around the tool call on every attached
-/// client — the multi-pane "out of order" bug.
+/// Regression: the sampler-event drainer must release the per-turn stream-drain barrier when (and only when) it processes the `Completed` event.
+/// `run_turn_via_sampler` awaits this barrier before the turn loop emits the canonical client `ToolCall`s.
+/// Without it the tool call's `send_update` on the turn-loop task could interleave between two still-draining text chunks on the drainer task.
 #[tokio::test(flavor = "current_thread")]
 async fn completed_event_releases_stream_drain_barrier_and_timeout_keeps_request_ownership() {
     use xai_grok_sampler::{InferenceLatencyStats, RequestId, SamplingChannel, SamplingEvent};
@@ -294,10 +277,10 @@ async fn completed_event_releases_stream_drain_barrier_and_timeout_keeps_request
             // Install the barrier exactly as `run_turn_via_sampler` does.
             let req = RequestId::random();
             let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-            actor
-                .turn_stream_drained
-                .lock()
-                .insert(req.clone(), Some(tx));
+            actor.turn_stream_drained.lock().insert(
+                req.clone(),
+                crate::session::acp_session::StreamOwnership::with_waiter(Some(tx)),
+            );
 
             actor
                 .handle_sampling_event(SamplingEvent::StreamStarted {
@@ -306,9 +289,8 @@ async fn completed_event_releases_stream_drain_barrier_and_timeout_keeps_request
                 })
                 .await;
 
-            // A mid-stream text chunk must NOT release the barrier — only the
-            // terminal Completed does, otherwise the tool call could still race
-            // ahead of trailing text.
+            // A mid-stream text chunk must NOT release the barrier; only the terminal Completed does
+            // Otherwise the tool call could still race ahead of trailing text
             actor
                 .handle_sampling_event(SamplingEvent::ChannelToken {
                     request_id: req.clone(),
@@ -369,8 +351,7 @@ async fn completed_event_releases_stream_drain_barrier_and_timeout_keeps_request
                 })
                 .await;
 
-            // Completed took the sender and fired it, so the turn loop's await
-            // resolves and it can now emit the tool call (after the text).
+            // Completed took the sender and fired it, so the turn loop's await resolves and it can now emit the tool call (after the text)
             assert!(
                 !actor.turn_stream_drained.lock().contains_key(&req),
                 "Completed must take the stream-drain barrier sender"
@@ -381,14 +362,14 @@ async fn completed_event_releases_stream_drain_barrier_and_timeout_keeps_request
                  run_turn_via_sampler can proceed to emit tool calls in order"
             );
 
-            // A timeout drops only the ordering waiter. Request ownership stays
-            // until the terminal event applies lifecycle side effects.
+            // A timeout drops only the ordering waiter
+            // Request ownership stays until the terminal event applies its side effects
             let late_req = RequestId::random();
             let (late_tx, late_rx) = tokio::sync::oneshot::channel::<()>();
-            actor
-                .turn_stream_drained
-                .lock()
-                .insert(late_req.clone(), Some(late_tx));
+            actor.turn_stream_drained.lock().insert(
+                late_req.clone(),
+                crate::session::acp_session::StreamOwnership::with_waiter(Some(late_tx)),
+            );
             actor
                 .handle_sampling_event(SamplingEvent::StreamStarted {
                     request_id: late_req.clone(),
@@ -408,6 +389,7 @@ async fn completed_event_releases_stream_drain_barrier_and_timeout_keeps_request
                 .lock()
                 .get_mut(&late_req)
                 .expect("late request remains owned")
+                .waiter
                 .take();
             assert!(late_rx.await.is_err(), "the ordering waiter was dropped");
             assert!(
@@ -458,10 +440,10 @@ async fn completed_event_releases_stream_drain_barrier_and_timeout_keeps_request
 
             let newer_req = RequestId::random();
             let (newer_tx, _newer_rx) = tokio::sync::oneshot::channel::<()>();
-            actor
-                .turn_stream_drained
-                .lock()
-                .insert(newer_req.clone(), Some(newer_tx));
+            actor.turn_stream_drained.lock().insert(
+                newer_req.clone(),
+                crate::session::acp_session::StreamOwnership::with_waiter(Some(newer_tx)),
+            );
             actor
                 .handle_sampling_event(SamplingEvent::StreamStarted {
                     request_id: newer_req.clone(),
@@ -640,10 +622,8 @@ async fn unowned_retry_does_not_notify_the_next_turn() {
         .await;
 }
 
-/// `SamplingEvent::Failed` (fired by the sampler for cancellation,
-/// `MaxTokensTruncation`, etc.) must NOT clear the accumulator —
-/// the consumer needs to take it via `TakeStreamingCapture` and
-/// upload as `streaming_partial.json`.
+/// `SamplingEvent::Failed` (fired by the sampler for cancellation, `MaxTokensTruncation`, etc.) must NOT clear the accumulator.
+/// The consumer needs to take it via `TakeStreamingCapture` and upload it as `streaming_partial.json`.
 #[tokio::test(flavor = "current_thread")]
 async fn failed_event_preserves_streaming_capture_for_takeout() {
     use xai_grok_sampler::{
@@ -662,10 +642,10 @@ async fn failed_event_preserves_streaming_capture_for_takeout() {
 
             let req = RequestId::random();
             let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-            actor
-                .turn_stream_drained
-                .lock()
-                .insert(req.clone(), Some(tx));
+            actor.turn_stream_drained.lock().insert(
+                req.clone(),
+                crate::session::acp_session::StreamOwnership::with_waiter(Some(tx)),
+            );
 
             actor
                 .handle_sampling_event(SamplingEvent::StreamStarted {
@@ -689,8 +669,7 @@ async fn failed_event_preserves_streaming_capture_for_takeout() {
                 })
                 .await;
 
-            // Simulate sampler-side terminal failure after a discarded attempt
-            // reported detector incidence.
+            // Simulate a sampler-side terminal failure after a discarded attempt reported doom-loop signals
             actor
                 .handle_sampling_event(SamplingEvent::Failed {
                     request_id: req.clone(),
@@ -732,10 +711,10 @@ async fn failed_event_preserves_streaming_capture_for_takeout() {
                 .expect("signals snapshot")
                 .error_count;
             let timed_out = RequestId::random();
-            actor
-                .turn_stream_drained
-                .lock()
-                .insert(timed_out.clone(), None);
+            actor.turn_stream_drained.lock().insert(
+                timed_out.clone(),
+                crate::session::acp_session::StreamOwnership::with_waiter(None),
+            );
             actor
                 .handle_sampling_event(SamplingEvent::Failed {
                     request_id: timed_out,
@@ -817,10 +796,9 @@ async fn failed_event_preserves_streaming_capture_for_takeout() {
         .await;
 }
 
-/// Observe-only (`max_retries = 0`): a first completion carrying confident
-/// signals had NOTHING discarded, so it must not be classified as a
-/// budget-spent accept — no tally, no counters, no capture stamp; the
-/// signals stay warn-only on the accepted response.
+/// Observe-only (`max_retries = 0`): a first completion carrying confident signals had nothing discarded.
+/// It must not be classified as accepted after budget: no tally, no counters, no capture stamp.
+/// The signals only warn on the accepted response.
 #[tokio::test(flavor = "current_thread")]
 async fn observe_only_confident_completion_stays_warn_only() {
     use xai_grok_sampler::{RequestId, SamplingChannel, SamplingEvent};
@@ -842,10 +820,10 @@ async fn observe_only_confident_completion_stays_warn_only() {
 
             let req = RequestId::random();
             let (tx, _rx) = tokio::sync::oneshot::channel::<()>();
-            actor
-                .turn_stream_drained
-                .lock()
-                .insert(req.clone(), Some(tx));
+            actor.turn_stream_drained.lock().insert(
+                req.clone(),
+                crate::session::acp_session::StreamOwnership::with_waiter(Some(tx)),
+            );
             actor
                 .handle_sampling_event(SamplingEvent::StreamStarted {
                     request_id: req.clone(),
@@ -860,7 +838,7 @@ async fn observe_only_confident_completion_stays_warn_only() {
                     chunk_index: 0,
                 })
                 .await;
-            // First completion carries confident signals — NO prior Retrying.
+            // The first completion carries confident signals with NO prior Retrying
             let response = xai_grok_sampling_types::ConversationResponse {
                 items: vec![xai_grok_sampling_types::ConversationItem::assistant(
                     "answer kept as-is",
@@ -943,10 +921,10 @@ async fn exact_repetition_completion_is_tracked_for_incidence_only() {
             };
             let req = RequestId::random();
             let (tx, _rx) = tokio::sync::oneshot::channel::<()>();
-            actor
-                .turn_stream_drained
-                .lock()
-                .insert(req.clone(), Some(tx));
+            actor.turn_stream_drained.lock().insert(
+                req.clone(),
+                crate::session::acp_session::StreamOwnership::with_waiter(Some(tx)),
+            );
             actor
                 .handle_sampling_event(SamplingEvent::Completed {
                     request_id: req,
@@ -976,11 +954,9 @@ async fn exact_repetition_completion_is_tracked_for_incidence_only() {
         .await;
 }
 
-/// A recovered turn's capture carries doom-stamped segments: the doomed
-/// generation's Retrying (kind `DoomLoopDetected`, triggers + abort chunk)
-/// stamps the in-progress slot, the resample's `StreamStarted` folds it into
-/// `segments`, and a budget-spent accept folds a text-free stamped segment
-/// on `Completed`. Session counters and the per-turn tally track along.
+/// A recovered turn's capture carries doom-stamped segments.
+/// The doomed generation's Retrying (kind `DoomLoopDetected`, with triggers and abort chunk) stamps the in-progress slot.
+/// The resample's `StreamStarted` folds it into `segments`, and an accept after budget folds a text-free stamped segment on `Completed`.
 #[tokio::test(flavor = "current_thread")]
 async fn doom_loop_recovery_stamps_capture_segments_and_counters() {
     use xai_grok_sampler::{RequestId, SamplingChannel, SamplingErrorKind, SamplingEvent};
@@ -988,14 +964,12 @@ async fn doom_loop_recovery_stamps_capture_segments_and_counters() {
     local
         .run_until(async {
             let mut fixture = make_replay_send_update_fixture().await;
-            // Arm the policy so the Completed arm can classify a
-            // budget-spent accept.
+            // Set the policy so the Completed arm can classify an accept after budget
             fixture.actor.doom_loop_recovery =
                 Some(xai_grok_sampling_types::DoomLoopRecoveryPolicy::default());
             let actor = Arc::new(fixture.actor);
 
-            // Same-turn identity so the resample's StreamStarted folds the
-            // doomed slot instead of beginning a new turn.
+            // The same prompt id makes the resample's StreamStarted fold the doomed slot instead of beginning a new turn
             *actor
                 .current_prompt_id
                 .lock()
@@ -1003,10 +977,10 @@ async fn doom_loop_recovery_stamps_capture_segments_and_counters() {
 
             let req = RequestId::random();
             let (tx, _rx) = tokio::sync::oneshot::channel::<()>();
-            actor
-                .turn_stream_drained
-                .lock()
-                .insert(req.clone(), Some(tx));
+            actor.turn_stream_drained.lock().insert(
+                req.clone(),
+                crate::session::acp_session::StreamOwnership::with_waiter(Some(tx)),
+            );
             actor
                 .handle_sampling_event(SamplingEvent::StreamStarted {
                     request_id: req.clone(),
@@ -1021,8 +995,7 @@ async fn doom_loop_recovery_stamps_capture_segments_and_counters() {
                     chunk_index: 0,
                 })
                 .await;
-            // Incidence carries every label on the doomed attempt, including
-            // exact repetition that does not participate in recovery policy.
+            // Incidence carries every label on the doomed attempt, including exact repetition that does not participate in the recovery policy
             actor
                 .handle_sampling_event(SamplingEvent::DoomLoopSignals {
                     request_id: req.clone(),
@@ -1099,8 +1072,10 @@ async fn doom_loop_recovery_stamps_capture_segments_and_counters() {
                 .await;
 
             let cap = actor.streaming_turn_capture.lock().clone();
-            assert_eq!(cap.segments.len(), 2, "doomed fold + text-free accept");
-            let resampled = cap.segments[0].doom_loop.as_ref().expect("stamped");
+            let [resampled_seg, accepted_seg] = cap.segments.as_slice() else {
+                panic!("doomed fold + text-free accept: {:?}", cap.segments);
+            };
+            let resampled = resampled_seg.doom_loop.as_ref().expect("stamped");
             assert_eq!(resampled.action, "resampled");
             assert_eq!(resampled.attempt, 1);
             assert_eq!(resampled.aborted_at_chunk, Some(421));
@@ -1108,11 +1083,11 @@ async fn doom_loop_recovery_stamps_capture_segments_and_counters() {
                 resampled.doom_loop_triggers,
                 vec!["tail_repetition:8@thinking".to_string()]
             );
-            assert_eq!(cap.segments[0].reasoning_text, "loop loop loop");
-            let accepted = cap.segments[1].doom_loop.as_ref().expect("stamped");
+            assert_eq!(resampled_seg.reasoning_text, "loop loop loop");
+            let accepted = accepted_seg.doom_loop.as_ref().expect("stamped");
             assert_eq!(accepted.action, "accepted_after_budget");
             assert!(
-                cap.segments[1].reasoning_text.is_empty(),
+                accepted_seg.reasoning_text.is_empty(),
                 "committed text lives in history, not the capture"
             );
             assert!(cap.has_doom_loop_segments());
@@ -1151,10 +1126,8 @@ async fn doom_loop_recovery_stamps_capture_segments_and_counters() {
         .await;
 }
 
-/// A `ToolCallDelta` arriving after the model streamed some reasoning
-/// must re-label the live capture as tied to the tool-call phase while
-/// preserving the reasoning text already accumulated — so a partial
-/// taken at that point shows the model was cut off mid tool-call.
+/// A `ToolCallDelta` arriving after the model streamed some reasoning must re-label the live capture as the tool-call phase.
+/// It must preserve the reasoning text already accumulated, so a partial taken then shows the model was cut off mid tool-call.
 #[tokio::test(flavor = "current_thread")]
 async fn tool_call_delta_marks_streaming_capture_phase() {
     use xai_grok_sampler::{RequestId, SamplingChannel, SamplingEvent};
@@ -1211,8 +1184,7 @@ async fn tool_call_delta_marks_streaming_capture_phase() {
         .await;
 }
 
-/// `ToolCallDelta` on an idle (empty, never-begun) slot must not
-/// fabricate a phase — there is no partial to attribute it to.
+/// `ToolCallDelta` on an idle (empty, never-begun) slot must not fabricate a phase; there is no partial to attribute it to.
 #[tokio::test(flavor = "current_thread")]
 async fn tool_call_delta_on_idle_slot_leaves_phase_pending() {
     use xai_grok_sampler::{RequestId, SamplingEvent};
@@ -1240,10 +1212,8 @@ async fn tool_call_delta_on_idle_slot_leaves_phase_pending() {
         .await;
 }
 
-/// `StreamingTurnCapture::append` must respect the byte cap so that
-/// a runaway extended-thinking turn cannot blow the actor's memory.
-/// The capture is marked `truncated = true` once the cap is hit, but
-/// the structure is still serializable.
+/// `StreamingTurnCapture::append` must respect the byte cap so that a runaway extended-thinking turn cannot blow the actor's memory.
+/// The capture is marked `truncated = true` once the cap is hit, but the structure is still serializable.
 #[test]
 fn streaming_capture_appender_respects_byte_cap() {
     let mut cap = StreamingTurnCapture::default();
@@ -1266,8 +1236,7 @@ fn streaming_capture_appender_respects_byte_cap() {
     cap.append(true, "ccccccccccc");
     assert_eq!(cap.reasoning_text.len(), pre_len);
 
-    // Must still round-trip through serde_json (the upload path
-    // serializes via `serde_json::to_vec_pretty`).
+    // Must still round-trip through serde_json (the upload path serializes via `serde_json::to_vec_pretty`)
     let bytes = serde_json::to_vec_pretty(&cap).expect("serialize capture");
     let parsed: StreamingTurnCapture = serde_json::from_slice(&bytes).expect("round-trip capture");
     assert!(parsed.truncated);
@@ -1279,18 +1248,9 @@ fn streaming_capture_appender_respects_byte_cap() {
     );
 }
 
-/// A multi-generation reasoning-only turn taken through the real
-/// `SessionCommand::TakeStreamingCapture` command (served by a spawned
-/// `run_session`), after the real `handle_sampling_failure` reasoning-only
-/// terminal, must yield a capture whose `segments` hold every uncommitted
-/// generation, in order, stamped with the terminal `empty_reason`. That command
-/// + finalize + terminal-failure path is the unique seam here; the struct tests
-/// in `streaming_capture.rs` and `same_prompt_restart_accumulates_segments_via_handler`
-/// already pin the fold-don't-wipe accumulation, so this asserts only the
-/// segment count/order and `empty_reason`. Two generations suffice — before the
-/// fix the slot was wiped on each same-turn `StreamStarted`, leaving one. This
-/// simulates the events a reasoning-only doomloop produces; it does not drive
-/// the sampler classifier (the mock-HTTP test covers that).
+/// A multi-generation reasoning-only turn must yield a capture whose `segments` hold every uncommitted generation, in order.
+/// The struct tests in `streaming_capture.rs` and `same_prompt_restart_accumulates_segments_via_handler` pin that a restart folds rather than wipes.
+/// Two generations suffice: a wiped slot on each same-turn `StreamStarted` would leave only one.
 #[tokio::test(start_paused = true)]
 async fn reasoning_only_doomloop_turn_captures_every_generation_as_segments() {
     use xai_grok_sampler::{
@@ -1314,9 +1274,8 @@ async fn reasoning_only_doomloop_turn_captures_every_generation_as_segments() {
                 .lock()
                 .expect("current_prompt_id mutex poisoned") = Some("prompt-doomloop".to_string());
 
-            // Two reasoning-only generations under the SAME prompt id — enough to
-            // prove more than the last survives. A same-prompt `StreamStarted`
-            // folds the prior in-progress generation into `segments`.
+            // Two reasoning-only generations under the SAME prompt id: enough to prove more than the last survives
+            // A same-prompt `StreamStarted` folds the prior in-progress generation into `segments`
             let req = RequestId::random();
             own_request(&actor, &req);
             actor
@@ -1348,9 +1307,8 @@ async fn reasoning_only_doomloop_turn_captures_every_generation_as_segments() {
                 })
                 .await;
 
-            // The sampler's terminal event once retries are exhausted, carrying
-            // the same empty-response context the L2 stream attaches for a
-            // reasoning-only completion.
+            // This is the sampler's terminal event once retries are exhausted
+            // It carries the same empty-response context the L2 stream attaches for a reasoning-only completion
             let error = SamplingErrorInfo {
                 kind: SamplingErrorKind::EmptyResponse,
                 status_code: None,
@@ -1377,8 +1335,7 @@ async fn reasoning_only_doomloop_turn_captures_every_generation_as_segments() {
                 credential: xai_grok_sampling_types::SentCredential::Unknown,
             };
 
-            // Drainer side: the terminal `Failed` is telemetry-only and must NOT
-            // collapse the accumulated doomloop segments.
+            // Drainer side: the terminal `Failed` is telemetry-only and must NOT collapse the accumulated doomloop segments
             actor
                 .handle_sampling_event(SamplingEvent::Failed {
                     request_id: req,
@@ -1386,10 +1343,9 @@ async fn reasoning_only_doomloop_turn_captures_every_generation_as_segments() {
                 })
                 .await;
 
-            // Turn-loop side: a reasoning-only empty response is non-recoverable,
-            // so it is a terminal error and stamps the classification onto the
-            // capture. `SamplerFailureRecovery` is not `Debug`, so match rather
-            // than `expect_err`.
+            // Turn-loop side: a reasoning-only empty response is non-recoverable, so it is a terminal error
+            // It stamps the classification onto the capture
+            // `SamplerFailureRecovery` is not `Debug`, so match rather than `expect_err`
             let Err(_terminal) = actor
                 .handle_sampling_failure(
                     error,
@@ -1400,15 +1356,16 @@ async fn reasoning_only_doomloop_turn_captures_every_generation_as_segments() {
                         episode_start: None,
                         enabled: true,
                     },
+                    false,
+                    TurnParkState::Fresh,
                 )
                 .await
             else {
                 panic!("a reasoning_only empty response must be a terminal error, not recoverable");
             };
 
-            // Take the capture exactly as the trace upload does: through the real
-            // `TakeStreamingCapture` command, which finalizes the uncommitted
-            // generations for upload.
+            // Take the capture exactly as the trace upload does: through the real `TakeStreamingCapture` command
+            // The command finalizes the uncommitted generations for upload
             let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<SessionCommand>();
             let (_chat_tx, chat_rx) = mpsc::unbounded_channel::<xai_chat_state::ChatStateEvent>();
             let codebase_indexes = Arc::new(parking_lot::Mutex::new(
@@ -1438,18 +1395,19 @@ async fn reasoning_only_doomloop_turn_captures_every_generation_as_segments() {
                 .expect("the take responder must not be dropped")
                 .expect("a reasoning-only doomloop turn must yield a non-empty capture");
 
-            // The seam's unique guarantee: every uncommitted reasoning-only
-            // generation is kept as its own segment, in order, and the terminal
-            // classification rode through the command's finalize. Finer-grained
-            // properties (timestamps, joined-view separators, token magnitude)
-            // are owned by the `streaming_capture.rs` struct tests.
+            // This path's unique guarantee: every uncommitted reasoning-only generation is kept as its own segment, in order
+            // The terminal classification also came through the command's finalize
+            // Finer-grained properties (timestamps, joined-view separators, token magnitude) are owned by the `streaming_capture.rs` struct tests
             assert_eq!(
                 capture.segments.len(),
                 2,
                 "both reasoning-only generations must be retained as segments",
             );
-            assert_eq!(capture.segments[0].reasoning_text, "thinking attempt 1");
-            assert_eq!(capture.segments[1].reasoning_text, "thinking attempt 2");
+            let [first, second] = capture.segments.as_slice() else {
+                panic!("expected two reasoning segments: {:?}", capture.segments);
+            };
+            assert_eq!(first.reasoning_text, "thinking attempt 1");
+            assert_eq!(second.reasoning_text, "thinking attempt 2");
             assert_eq!(capture.empty_reason.as_deref(), Some("reasoning_only"));
         })
         .await;
@@ -1483,7 +1441,12 @@ async fn provider_rollover_tracks_winner_without_stamping_sampling_config() {
                         .expect("test context_window must be non-zero"),
                     reasoning_effort: None,
                     stream_tool_calls: None,
-                },
+                                    mtls_cert_dir: Default::default(),
+                    max_retries: Default::default(),
+                    rate_limit_retry_threshold: Default::default(),
+                    conversation_group_id: Default::default(),
+                    reasoning_summary: Default::default(),
+},
                 Box::new(xai_chat_state::NullChatPersistence),
                 chat_event_tx,
                 tokio_util::sync::CancellationToken::new(),
@@ -1576,7 +1539,12 @@ async fn reconstruct_full_config_adopts_served_model_for_sidecars() {
                         .expect("test context_window must be non-zero"),
                     reasoning_effort: None,
                     stream_tool_calls: None,
-                },
+                                    mtls_cert_dir: Default::default(),
+                    max_retries: Default::default(),
+                    rate_limit_retry_threshold: Default::default(),
+                    conversation_group_id: Default::default(),
+                    reasoning_summary: Default::default(),
+},
                 Box::new(xai_chat_state::NullChatPersistence),
                 chat_event_tx,
                 tokio_util::sync::CancellationToken::new(),
@@ -1614,7 +1582,12 @@ async fn reconstruct_full_config_adopts_served_model_for_sidecars() {
                 compaction_at_tokens: None,
                 doom_loop_recovery: None,
                 header_injector: None,
-            };
+                            mtls_cert_dir: Default::default(),
+                request_compression: Default::default(),
+                rate_limit_retry_threshold: Default::default(),
+                reasoning_summary: Default::default(),
+                conversation_group_id: Default::default(),
+};
             let mut chain_winner = chain_base.clone();
             chain_winner.model = "claude-sonnet-4".to_string();
             chain_winner.base_url = "http://anthropic.test".to_string();
@@ -1683,7 +1656,12 @@ async fn reconstruct_full_config_falls_back_to_chain_head_before_first_serve() {
                         .expect("test context_window must be non-zero"),
                     reasoning_effort: None,
                     stream_tool_calls: None,
-                },
+                                    mtls_cert_dir: Default::default(),
+                    max_retries: Default::default(),
+                    rate_limit_retry_threshold: Default::default(),
+                    conversation_group_id: Default::default(),
+                    reasoning_summary: Default::default(),
+},
                 Box::new(xai_chat_state::NullChatPersistence),
                 chat_event_tx,
                 tokio_util::sync::CancellationToken::new(),
@@ -1721,7 +1699,12 @@ async fn reconstruct_full_config_falls_back_to_chain_head_before_first_serve() {
                 compaction_at_tokens: None,
                 doom_loop_recovery: None,
                 header_injector: None,
-            };
+                            mtls_cert_dir: Default::default(),
+                request_compression: Default::default(),
+                rate_limit_retry_threshold: Default::default(),
+                reasoning_summary: Default::default(),
+                conversation_group_id: Default::default(),
+};
             let (sampler_event_tx, _sampler_event_rx) = tokio::sync::mpsc::unbounded_channel::<
                 xai_grok_sampler::SamplingEvent,
             >();
@@ -1773,7 +1756,12 @@ async fn reconstruct_full_config_adopts_session_config_for_grok_head() {
                         .expect("test context_window must be non-zero"),
                     reasoning_effort: None,
                     stream_tool_calls: None,
-                },
+                                    mtls_cert_dir: Default::default(),
+                    max_retries: Default::default(),
+                    rate_limit_retry_threshold: Default::default(),
+                    conversation_group_id: Default::default(),
+                    reasoning_summary: Default::default(),
+},
                 Box::new(xai_chat_state::NullChatPersistence),
                 chat_event_tx,
                 tokio_util::sync::CancellationToken::new(),
@@ -1811,7 +1799,12 @@ async fn reconstruct_full_config_adopts_session_config_for_grok_head() {
                 compaction_at_tokens: None,
                 doom_loop_recovery: None,
                 header_injector: None,
-            };
+                            mtls_cert_dir: Default::default(),
+                request_compression: Default::default(),
+                rate_limit_retry_threshold: Default::default(),
+                reasoning_summary: Default::default(),
+                conversation_group_id: Default::default(),
+};
             let (sampler_event_tx, _sampler_event_rx) = tokio::sync::mpsc::unbounded_channel::<
                 xai_grok_sampler::SamplingEvent,
             >();

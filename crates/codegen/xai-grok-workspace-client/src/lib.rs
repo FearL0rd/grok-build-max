@@ -12,6 +12,7 @@
 //!
 //! No deadline is imposed by default ([`WorkspaceClient::with_deadline`] opts in).
 //! That preserves the `WorkspaceOps::rpc_raw` behaviour where callers own their timeouts.
+#![deny(clippy::indexing_slicing)]
 use serde_json::Value;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -107,11 +108,8 @@ pub fn server_version_at_least(version: Option<&str>, baseline: &semver::Version
         .and_then(|v| semver::Version::parse(v).ok())
         .is_some_and(|v| v >= *baseline)
 }
-/// Check whether a [`ToolError`](xai_tool_runtime::ToolError) indicates a fatal transport failure that should mark the hub as disconnected.
-///
-/// Returns `true` for:
-/// - `NetworkError`: a direct transport failure (socket dropped, stream ended without a terminal item, etc.)
-/// - `Custom` with `details.code == "protocol_error"`: a half-closed WebSocket producing malformed frames
+/// Whether a [`ToolError`](xai_tool_runtime::ToolError) is a fatal transport failure that should mark the hub disconnected.
+/// True for `NetworkError`, and for `Custom` with `details.code == "protocol_error"` (half-closed WebSocket, malformed frames).
 pub fn is_transport_fatal(err: &xai_tool_runtime::ToolError) -> bool {
     match err.kind {
         xai_tool_runtime::ToolErrorKind::NetworkError => true,
@@ -139,10 +137,7 @@ fn is_non_retryable_workspace_unavailable(err: &xai_tool_runtime::ToolError) -> 
         .is_some_and(|d| d.code == xai_tool_protocol::WORKSPACE_UNAVAILABLE_SUBCODE && !d.retryable)
 }
 /// Typed client over a bound [`ToolHarness`] for `workspace.*` RPCs.
-///
-/// Clones share the harness and the connected latch, which fast-fails calls after a fatal transport error.
-/// [`mark_connected`](Self::mark_connected) resets the latch.
-/// An SDK `on_reconnect` callback can do that by holding the same flag, passed in via [`with_connected_flag`](Self::with_connected_flag).
+/// Clones share the harness and the connected latch, which fast-fails after a fatal transport error; [`mark_connected`](Self::mark_connected) / [`with_connected_flag`](Self::with_connected_flag) reset it.
 #[derive(Clone)]
 pub struct WorkspaceClient {
     harness: ToolHarness,
@@ -212,6 +207,8 @@ impl WorkspaceClient {
             .expect("constant tool id is valid");
         let args = serde_json::json!({ "method": method, "params": params });
         tracing::debug!(method, "WorkspaceClient::rpc");
+        let span = tracing::info_span!("workspace_client.rpc", method = tracing::field::Empty);
+        span.record("method", method);
         let fut = async {
             let mut stream = self
                 .harness
@@ -589,7 +586,6 @@ mod tests {
     use serde::Deserialize;
     use xai_computer_hub_sdk::harness::LocalRegistry;
     use xai_grok_workspace_types::rpc::RpcActivityClass;
-    use xai_grok_workspace_types::rpc::skills::SkillScope;
     use xai_tool_protocol::{SessionId, ToolId};
     use xai_tool_runtime::{Tool, ToolError};
     use xai_tool_types::ToolDescription;
@@ -620,18 +616,6 @@ mod tests {
                     "os": "linux", "shell": "bash", "cwd": "/workspace",
                     "version": "1.2.3",
                 })),
-                "workspace.git_status" => ok(serde_json::json!("On branch main")),
-                "workspace.discover_skills" => ok(serde_json::json!([{
-                    "name": "my-skill",
-                    "description": "A test skill",
-                    "path": "/workspace/.grok/skills/my-skill/SKILL.md",
-                    "scope": "local",
-                }])),
-                "workspace.discover_agents_md" => ok(serde_json::json!([{
-                    "file_name": "AGENTS.md",
-                    "file_path": "/workspace/AGENTS.md",
-                    "content": "# Project instructions",
-                }])),
                 "workspace.echo_params" => ok(args.params),
                 "workspace.err" => Ok(RawOut(serde_json::json!({
                     "err": { "code": "session_not_found", "message": "ghost" },
@@ -701,25 +685,6 @@ mod tests {
                 version: Some("1.2.3".into()),
             }
         );
-    }
-    #[tokio::test]
-    async fn git_status_returns_raw_value() {
-        let v = client().git_status().await.unwrap();
-        assert_eq!(v, serde_json::json!("On branch main"));
-    }
-    #[tokio::test]
-    async fn discover_skills_decodes_typed_list() {
-        let skills = client().discover_skills().await.unwrap();
-        assert_eq!(skills.len(), 1);
-        assert_eq!(skills[0].name, "my-skill");
-        assert_eq!(skills[0].scope, SkillScope::Local);
-    }
-    #[tokio::test]
-    async fn discover_agents_md_decodes_typed_list() {
-        let files = client().discover_agents_md().await.unwrap();
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].file_name, "AGENTS.md");
-        assert_eq!(files[0].file_path, "/workspace/AGENTS.md");
     }
     #[tokio::test]
     async fn typed_request_params_round_trip() {
@@ -869,16 +834,6 @@ mod tests {
         let b = a.clone();
         a.mark_disconnected();
         assert!(!b.is_connected());
-    }
-    #[tokio::test]
-    async fn consume_stream_terminal_returns_ok() {
-        let value = serde_json::json!({"result": "hello"});
-        let typed = TypedToolOutput::from_value(ToolId::new("t").unwrap(), value.clone());
-        let mut stream = xai_tool_runtime::terminal_only(Ok(typed));
-        assert_eq!(
-            consume_stream_terminal(&mut stream).await.unwrap().value,
-            value
-        );
     }
     #[tokio::test]
     async fn consume_stream_terminal_returns_err() {

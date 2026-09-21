@@ -10,7 +10,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 
 use xai_grok_sampling_types::conversation::{
-    AssistantItem, ConversationItem, ConversationRequest, SystemItem, UserItem,
+    AssistantItem, ConversationItem, ConversationRequest, SyntheticReason, SystemItem, UserItem,
 };
 use xai_grok_sampling_types::{ApiBackend, ContentPart, ToolSpec};
 
@@ -86,6 +86,11 @@ fn gemini_config(base_url: String) -> SamplerConfig {
         compaction_at_tokens: None,
         doom_loop_recovery: None,
         header_injector: None,
+        mtls_cert_dir: Default::default(),
+        request_compression: Default::default(),
+        rate_limit_retry_threshold: Default::default(),
+        reasoning_summary: Default::default(),
+        conversation_group_id: Default::default(),
     }
 }
 
@@ -94,12 +99,13 @@ fn user_request_with_system(system: &str, user: &str) -> ConversationRequest {
         items: vec![
             ConversationItem::System(SystemItem {
                 content: Arc::from(system),
+                synthetic_reason: SyntheticReason::Primary,
             }),
             ConversationItem::User(UserItem {
                 content: vec![ContentPart::Text {
                     text: Arc::from(user),
                 }],
-                synthetic_reason: None,
+                synthetic_reason: Default::default(),
                 ..Default::default()
             }),
         ],
@@ -113,7 +119,7 @@ fn user_request(text: &str) -> ConversationRequest {
             content: vec![ContentPart::Text {
                 text: Arc::from(text),
             }],
-            synthetic_reason: None,
+            synthetic_reason: Default::default(),
             ..Default::default()
         })],
         ..Default::default()

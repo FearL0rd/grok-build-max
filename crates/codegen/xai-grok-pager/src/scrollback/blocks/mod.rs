@@ -1,8 +1,8 @@
 mod agent;
 mod bg_task;
 mod btw;
+mod cancel_cause;
 mod context_info;
-mod credit_limit;
 pub mod markdown_content;
 pub mod mermaid_content;
 mod quote_bar;
@@ -15,11 +15,12 @@ mod user;
 mod workflow;
 
 pub use agent::AgentMessageBlock;
+pub(crate) use bg_task::KILLED_SIGNAL;
 pub use bg_task::{BgTaskBlock, BgTaskKind};
 pub use btw::BtwBlock;
+pub use cancel_cause::CancelledBy;
 pub use context_info::ContextInfoBlock;
-pub use credit_limit::{CreditLimitBlock, CreditLimitCardAction};
-pub use session_event::{SessionEvent, SessionEventBlock};
+pub use session_event::{MemoryCaptureBlock, MemoryCommandKind, SessionEvent, SessionEventBlock};
 pub use subagent::{SubagentBlock, SubagentBlockKind};
 pub use system::SystemMessageBlock;
 pub use thinking::ThinkingBlock;

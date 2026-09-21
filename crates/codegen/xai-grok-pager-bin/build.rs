@@ -14,8 +14,8 @@ fn git_stdout(args: &[&str]) -> Option<String> {
 fn main() {
     println!("cargo:rerun-if-env-changed=GROK_VERSION");
 
-    // Watch the git files that change on commit/checkout so the version stamp refreshes. Never
-    // emit a missing path: cargo treats it as always dirty and rebuilds this crate every build.
+    // Watch the git files that change on commit/checkout so the version stamp refreshes
+    // Never emit a missing path: cargo treats it as always dirty and rebuilds this crate every build
     let mut watch_paths = Vec::new();
     watch_paths.extend(git_stdout(&["rev-parse", "--git-path", "HEAD"]));
     watch_paths.extend(git_stdout(&["rev-parse", "--git-path", "logs/HEAD"]));
@@ -36,4 +36,14 @@ fn main() {
         .unwrap_or_else(|_| "0.0.0".to_string());
 
     println!("cargo:rustc-env=VERSION_WITH_COMMIT={version} ({commit})");
+
+    // grove-projfs imports `ProjectedFSLib.dll`, absent until `Client-ProjFS` is
+    // enabled; a load-time import kills startup with STATUS_DLL_NOT_FOUND. Link
+    // args from grove-projfs/build.rs do not propagate to this exe.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+        && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
+    {
+        println!("cargo:rustc-link-arg=/DELAYLOAD:ProjectedFSLib.dll");
+        println!("cargo:rustc-link-arg=delayimp.lib");
+    }
 }

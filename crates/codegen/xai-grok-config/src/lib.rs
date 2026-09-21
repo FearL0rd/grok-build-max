@@ -1,21 +1,23 @@
 //! Config file loading for Grok.
 //!
-//! Merge order (lowest → highest priority):
+//! Merge order (lowest to highest priority):
 //! 1. `/etc/grok/managed_config.toml`
 //! 2. `$GROK_HOME/managed_config.toml`
 //! 3. `$GROK_HOME/config.toml`
-//! 4. `$GROK_HOME/requirements.toml` (cloud cache; Ed25519-signed at rest once a
-//!    key is embedded — see [`signed_policy`] — below the OS-protected layers)
+//! 4. `$GROK_HOME/requirements.toml` (cloud cache; Ed25519-signed at rest once a key is embedded, see [`signed_policy`])
 //! 5. `/etc/grok/requirements.toml`
-//! 6. macOS MDM managed preferences (`ai.x.grok`, admin-forced) — macOS only
+//! 6. macOS MDM managed preferences (`ai.x.grok`, admin-forced), macOS only
 //!
-//! Each layer applies its own [`[[version_overrides]]`](version_overrides)
-//! before merge. Requirements layers (#4–#6) may opt into fail-closed startup;
-//! see [`validate_requirements`].
+//! Each layer applies its own [`[[version_overrides]]`](version_overrides) before merge.
+//! Requirements layers (#4 through #6) may opt into fail-closed startup; see [`validate_requirements`].
+
+#![deny(clippy::indexing_slicing)]
 
 pub mod campaigns;
 mod config_layers;
 pub mod config_override;
+pub mod deserialize;
+mod display_refresh;
 mod env_overlay;
 pub mod fs_atomic;
 pub mod global_hook_sources;
@@ -29,8 +31,8 @@ pub mod signed_policy;
 mod validation;
 pub mod version_overrides;
 
-// Only the cross-crate campaign surface is re-exported at the root; the rest stays
-// reachable via the `pub mod` paths for in-crate use without widening the API.
+// Only the campaign items other crates need are re-exported at the root
+// The rest stays reachable via the `pub mod` paths, keeping the root API narrow
 pub use campaigns::{
     CampaignEntry, CampaignOverrides, filter_active_campaigns, ids_touching_paths,
 };
@@ -46,6 +48,7 @@ pub use config_layers::{
     CampaignsState, ConfigLayers, campaigns_application_disabled, campaigns_state_path,
     load_dismissed_ids_from_home, load_effective_config_disk_only,
 };
+pub use display_refresh::DisplayRefreshSettings;
 pub use env_overlay::{
     GROK_CONFIG_ENV, GROK_CONFIG_PATH_ENV, OverlaySource, ResolvedOverlay, resolved_env_overlay,
 };
@@ -67,8 +70,9 @@ pub use managed_cache::{
     MANAGED_CONFIG_CACHE_FILE, ServingIdentity, SyncMarker, bump_rollback_floor,
     bump_rollback_floor_with_now, confirmed_team_switch, confirmed_team_switch_at,
     fail_closed_policy_armed_at, is_managed_config_hard_stale_for, is_managed_config_stale_for,
-    managed_config_identity_changed_at, managed_deployment_id, managed_policy_compromised_for,
-    mark_managed_config_synced, mark_managed_config_synced_at, normalize_identity,
+    managed_config_identity_changed_at, managed_config_synced_at, managed_deployment_id,
+    managed_policy_compromised_for, mark_managed_config_synced, mark_managed_config_synced_at,
+    normalize_identity,
 };
 pub use paths::{
     claude_managed_settings_path, claude_managed_settings_probe_path, create_dir_all_owner_only,
@@ -82,13 +86,4 @@ pub use validation::{
 };
 pub use version_overrides::{VersionOverrideError, apply_version_overrides};
 
-/// Parse an env var as a boolean. `None` if unset or unrecognized.
-pub fn env_bool(name: &str) -> Option<bool> {
-    let value = std::env::var(name).ok()?;
-    match value.trim().to_ascii_lowercase().as_str() {
-        "" => None,
-        "1" | "true" | "yes" | "on" | "enabled" => Some(true),
-        "0" | "false" | "no" | "off" | "disabled" => Some(false),
-        _ => None,
-    }
-}
+pub use xai_grok_env::env_bool;

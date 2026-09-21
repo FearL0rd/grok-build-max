@@ -1,15 +1,14 @@
-//! Shared hook source path discovery.
-
 use std::path::{Path, PathBuf};
 
 use xai_grok_config::resolve_global_hook_sources;
 use xai_grok_hooks::discovery::HookSource;
 use xai_grok_hooks::error::HookError;
+use xai_grok_workspace::HookSourceConfig;
 
-/// Owned paths for hook sources. Callers borrow via `as_sources()`.
+/// Owned hook sources. Callers borrow via `as_sources()`.
 pub(crate) struct HookSourcePaths {
-    pub global: Vec<PathBuf>,
-    pub project: Vec<PathBuf>,
+    pub global: Vec<HookSourceConfig>,
+    pub project: Vec<HookSourceConfig>,
 }
 
 impl HookSourcePaths {
@@ -18,9 +17,16 @@ impl HookSourcePaths {
         &self,
         include_project: bool,
     ) -> (Vec<HookSource<'_>>, Vec<HookSource<'_>>) {
-        let global = self.global.iter().map(|p| path_to_source(p)).collect();
+        let global = self
+            .global
+            .iter()
+            .map(HookSourceConfig::as_hook_source)
+            .collect();
         let project = if include_project {
-            self.project.iter().map(|p| path_to_source(p)).collect()
+            self.project
+                .iter()
+                .map(HookSourceConfig::as_hook_source)
+                .collect()
         } else {
             vec![]
         };
@@ -28,11 +34,12 @@ impl HookSourcePaths {
     }
 }
 
-fn path_to_source(p: &Path) -> HookSource<'_> {
-    if p.is_dir() {
-        HookSource::Directory(p)
+/// Vendor settings-file paths are classified at the call site so a directory there cannot load as a hook dir.
+fn classify_grok_hook_source(path: PathBuf) -> HookSourceConfig {
+    if path.is_dir() {
+        HookSourceConfig::Directory(path)
     } else {
-        HookSource::SettingsFile(p)
+        HookSourceConfig::SettingsFile(path)
     }
 }
 
@@ -45,8 +52,9 @@ fn include_cursor_hooks(compat: &xai_grok_tools::types::compat::CompatConfig) ->
     compat.cursor.hooks
 }
 
-/// Global + project hook source paths. Registry file is never a discovery
-/// source; compatible vendor globals are appended when their gates are on.
+/// Global and project hook source paths.
+/// The registry file is never a discovery source; Claude and Cursor sources are appended when their compat gates are on.
+/// Vendor settings paths are pushed as settings files here and probed for presence by xai_grok_workspace::folder_trust::repo_configs_present; a new vendor path needs both.
 pub(crate) fn discover_hook_source_paths(
     git_root: Option<&Path>,
     compat: &xai_grok_tools::types::compat::CompatConfig,
@@ -56,8 +64,8 @@ pub(crate) fn discover_hook_source_paths(
     let include_claude = include_claude_hooks(compat);
     let include_cursor = include_cursor_hooks(compat);
 
-    // Soft hooks-paths I/O keeps fixed slots; hard resolve omits Grok globals.
-    let mut global: Vec<PathBuf> =
+    // An unreadable hooks-paths file keeps the fixed Grok sources; a hard resolve failure omits all Grok global sources
+    let mut global: Vec<HookSourceConfig> =
         match resolve_global_hook_sources(grok.as_deref(), /* reject_symlinks */ false) {
             Ok(resolved) => {
                 if let Some(e) = &resolved.configured_error {
@@ -68,7 +76,7 @@ pub(crate) fn discover_hook_source_paths(
                 }
                 resolved
                     .discovery_sources()
-                    .map(|s| s.path.clone())
+                    .map(|s| classify_grok_hook_source(s.path.clone()))
                     .collect()
             }
             Err(e) => {
@@ -82,50 +90,65 @@ pub(crate) fn discover_hook_source_paths(
 
     if let Some(h) = home.as_deref() {
         if include_claude {
-            global.push(h.join(".claude").join("settings.json"));
-            global.push(h.join(".claude").join("settings.local.json"));
+            global.push(HookSourceConfig::SettingsFile(
+                h.join(".claude").join("settings.json"),
+            ));
+            global.push(HookSourceConfig::SettingsFile(
+                h.join(".claude").join("settings.local.json"),
+            ));
         }
         if include_cursor {
-            global.push(h.join(".cursor").join("hooks.json"));
+            global.push(HookSourceConfig::SettingsFile(
+                h.join(".cursor").join("hooks.json"),
+            ));
         }
     }
 
     let mut project = Vec::new();
     if let Some(root) = git_root {
         if include_claude {
-            project.push(root.join(".claude").join("settings.json"));
-            project.push(root.join(".claude").join("settings.local.json"));
+            project.push(HookSourceConfig::SettingsFile(
+                root.join(".claude").join("settings.json"),
+            ));
+            project.push(HookSourceConfig::SettingsFile(
+                root.join(".claude").join("settings.local.json"),
+            ));
         }
-        project.push(root.join(".grok").join("hooks"));
+        project.push(classify_grok_hook_source(root.join(".grok").join("hooks")));
         if include_cursor {
-            project.push(root.join(".cursor").join("hooks.json"));
+            project.push(HookSourceConfig::SettingsFile(
+                root.join(".cursor").join("hooks.json"),
+            ));
         }
     }
 
     HookSourcePaths { global, project }
 }
 
-/// Single load entry point: build compat-aware sources, gate project sources on
-/// trust, then load. Every session-startup and mid-session reload site routes
-/// through here so the source policy stays in one place.
+/// The disabled-hooks file plus the resolved `allow_managed_hooks_only` pin.
+pub(crate) fn disabled_hooks_snapshot() -> xai_grok_hooks::trust::DisabledHooks {
+    let managed_only = xai_grok_workspace::permission::resolution::managed_settings()
+        .non_managed_hooks
+        .is_disabled();
+    xai_grok_hooks::trust::DisabledHooks::load(managed_only)
+}
+
+/// Single load entry point: build compat-aware sources, gate project sources on trust, then load.
+/// Every session-startup and mid-session reload site routes through here so the source policy stays in one place.
 pub(crate) fn discover_hooks(
     git_root: Option<&Path>,
     compat: &xai_grok_tools::types::compat::CompatConfig,
     trusted: bool,
 ) -> (xai_grok_hooks::discovery::HookRegistry, Vec<HookError>) {
-    // Read fresh each call (not cached): a mid-session `/hooks` reload must see an
-    // updated `config.toml` / `managed_config.toml`. This is lighter than
-    // `ConfigLayers::load` (only the small per-layer files, no campaigns, version
-    // overrides, or MDM).
+    // Read fresh each call (not cached): a mid-session `/hooks` reload must see an updated `config.toml` or `managed_config.toml`
+    // This is lighter than `ConfigLayers::load` (only the small per-layer files, no campaigns, version overrides, or MDM)
     let config_layers = xai_grok_config::hook_config_layers();
     assemble_hooks(&config_layers, git_root, compat, trusted)
 }
 
-/// Pure, injectable core: combine config-layer hooks with file-source hooks and
-/// dedup once. Config-layer specs are placed first so that, under the first-wins
-/// dedup in [`xai_grok_hooks::discovery::registry_from_specs_deduped`], a config
-/// hook wins over a byte-identical file hook. `config_layers` is a parameter (not
-/// read here) so tests can drive it with hand-built layers.
+/// Pure, injectable core: combine config-layer hooks with file-source hooks and dedup once. Config-layer specs go first.
+/// The first-wins dedup in [`xai_grok_hooks::discovery::registry_from_specs_deduped`] then lets a config hook beat a byte-identical file hook.
+/// `config_layers` is a parameter (not read here) so tests can drive it with hand-built layers.
 pub(crate) fn assemble_hooks(
     config_layers: &[xai_grok_config::HookConfigLayer],
     git_root: Option<&Path>,
@@ -154,16 +177,13 @@ mod tests {
     use xai_grok_hooks::config::HookProvenance;
     use xai_grok_hooks::event::HookEventName;
 
-    /// Write `content` as `<dir>/requirements.toml`.
     fn write_requirements(dir: &Path, content: &str) {
         std::fs::write(dir.join("requirements.toml"), content).unwrap();
     }
 
-    /// A temp policy layer pinning hooks for `SessionStart`, `UserPromptSubmit`,
-    /// and `PreToolUse` flows through the real requirements read
-    /// (`hook_config_layers_at`) and the real assembly (`assemble_hooks`) and
-    /// registers all three with `Requirements` provenance — the provenance the
-    /// disable exemption keys on.
+    /// A temp policy layer pins hooks for `SessionStart`, `UserPromptSubmit`, and `PreToolUse`.
+    /// It flows through the real requirements read (`hook_config_layers_at`) and the real assembly (`assemble_hooks`).
+    /// All three register with `Requirements` provenance, the provenance the disable exemption keys on.
     #[test]
     fn requirements_layer_pins_hooks_with_requirements_provenance() {
         let system_dir = tempfile::tempdir().unwrap();
@@ -193,8 +213,11 @@ timeout = 5
 
         let layers = xai_grok_config::hook_config_layers_at(Some(system_dir.path()), None);
         assert_eq!(layers.len(), 1, "one requirements layer expected");
-        assert_eq!(layers[0].provenance(), HookProvenance::Requirements);
-        assert_eq!(layers[0].source_name(), "requirements/system");
+        let Some(layer) = layers.first() else {
+            panic!("one requirements layer expected: {layers:?}");
+        };
+        assert_eq!(layer.provenance(), HookProvenance::Requirements);
+        assert_eq!(layer.source_name(), "requirements/system");
 
         let compat = xai_grok_tools::types::compat::CompatConfig::default();
         let (registry, errors) = assemble_hooks(&layers, None, &compat, false);
@@ -231,12 +254,9 @@ timeout = 5
         }
     }
 
-    /// A realistic enterprise policy hooks shape (command hooks with
-    /// `timeout: 5`; `PreToolUse` with `matcher: "*"` and two hooks in one
-    /// group; matcher-less lifecycle groups) parses and registers through
-    /// the real path. The two `PreToolUse` hooks are byte-identical, so both
-    /// parse but content dedup registers one effective hook (running the
-    /// same script twice per event is collapsed).
+    /// A realistic enterprise policy hooks shape parses and registers through the real path.
+    /// The shape: command hooks with `timeout: 5`, `PreToolUse` with `matcher: "*"` and two hooks in one group, and matcher-less lifecycle groups.
+    /// The two `PreToolUse` hooks are byte-identical, so both parse but content dedup registers one effective hook.
     #[test]
     fn enterprise_policy_hooks_shape_registers() {
         let system_dir = tempfile::tempdir().unwrap();
@@ -293,9 +313,8 @@ timeout = 5
             assert_eq!(spec.timeout_ms, 5000, "timeout 5s converts to 5000ms");
         }
 
-        // Registry level through the real assembly: all three events register
-        // with requirements provenance; the byte-identical PreToolUse
-        // duplicate collapses to one effective hook.
+        // Registry level through the real assembly: all three events register with requirements provenance
+        // The byte-identical PreToolUse duplicate collapses to one effective hook
         let compat = xai_grok_tools::types::compat::CompatConfig::default();
         let (registry, errors) = assemble_hooks(&layers, None, &compat, false);
         assert!(errors.is_empty(), "errors: {errors:?}");
@@ -322,6 +341,38 @@ timeout = 5
                 .count(),
             1,
             "byte-identical duplicate collapses under content dedup"
+        );
+    }
+
+    #[test]
+    fn directory_at_cursor_hooks_json_does_not_load_child_hooks() {
+        let root = tempfile::tempdir().unwrap();
+        let disguised = root.path().join(".cursor").join("hooks.json");
+        std::fs::create_dir_all(&disguised).unwrap();
+        std::fs::write(
+            disguised.join("startup.json"),
+            r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"cursor_hooks_json_dir_probe.sh"}]}]}}"#,
+        )
+        .unwrap();
+
+        let compat = xai_grok_tools::types::compat::CompatConfig::default();
+        let (registry, errors) =
+            assemble_hooks(&[], Some(root.path()), &compat, /*trusted*/ true);
+
+        assert!(
+            !registry.all_hooks().iter().any(|h| {
+                h.command_raw
+                    .as_deref()
+                    .is_some_and(|c| c.contains("cursor_hooks_json_dir_probe"))
+            }),
+            "child JSON under a directory at .cursor/hooks.json must not load as hooks"
+        );
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                HookError::ReadFile { path, .. } if path == &disguised
+            )),
+            "reading the disguised directory as a settings file must surface ReadFile; got {errors:?}"
         );
     }
 }

@@ -120,11 +120,12 @@ fn merge_consecutive_same_role(contents: &mut Vec<Value>) {
 mod tests {
     use super::*;
     use xai_grok_sampling_types::ToolSpec;
-    use xai_grok_sampling_types::conversation::{SystemItem, UserItem};
+    use xai_grok_sampling_types::conversation::{SyntheticReason, SystemItem, UserItem};
 
     fn sys(text: &str) -> ConversationItem {
         ConversationItem::System(SystemItem {
             content: std::sync::Arc::from(text),
+            synthetic_reason: SyntheticReason::Primary,
         })
     }
 
@@ -133,7 +134,7 @@ mod tests {
             content: vec![ContentPart::Text {
                 text: std::sync::Arc::from(text),
             }],
-            synthetic_reason: None,
+            synthetic_reason: Default::default(),
             ..Default::default()
         })
     }

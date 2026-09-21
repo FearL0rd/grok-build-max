@@ -1,5 +1,3 @@
-//! MCP integration crate.
-//!
 //! Two responsibilities:
 //!
 //! 1. **Quarantines `rmcp` 2.1 and `reqwest` 0.13.** `rmcp` 2.1 requires
@@ -14,18 +12,16 @@
 //!    (`xai_grok_mcp::rmcp::*`).
 //!
 //! 2. **Owns MCP-specific integration code**:
-//!    - [`credentials`] -- on-disk `$GROK_HOME/mcp_credentials.json` store and
-//!      the rmcp `CredentialStore` adapter.
-//!    - `auth_status` -- decides auth for HTTP servers from what is on disk.
-//!    - [`oauth`] -- browser-based OAuth flow with cross-process + in-process
-//!      dedup.
-//!    - [`oauth_config`] -- BYO OAuth config types parsed out of `config.toml`.
-//!    - [`servers`] -- MCP transport layer (rmcp's `StreamableHttpClientTransport`
-//!      and `TokioChildProcess`) plus client lifecycle, tool invocation, error
-//!      classification, and managed-MCP refresh.
-//!    - [`mcp_http_client`] -- backoff wrapper around the HTTP client handed to
-//!      rmcp's streamable-HTTP transport (works around rmcp's zero-backoff SSE
-//!      reconnect loop).
+//!    - [`credentials`]: on-disk `$GROK_HOME/mcp_credentials.json` store and the rmcp `CredentialStore` adapter.
+//!    - `auth_status`: decides auth for HTTP servers from what is on disk.
+//!    - [`oauth`]: browser-based OAuth flow with cross-process and in-process dedup.
+//!    - [`oauth_config`]: BYO OAuth config types parsed out of `config.toml`.
+//!    - [`servers`]: MCP transport layer (rmcp's `StreamableHttpClientTransport` and `TokioChildProcess`).
+//!      It also owns client lifecycle, tool invocation, error classification, and managed-MCP refresh.
+//!    - [`mcp_http_client`]: backoff wrapper around the HTTP client handed to rmcp's streamable-HTTP transport.
+//!      It works around rmcp's zero-backoff SSE reconnect loop.
+
+#![deny(clippy::indexing_slicing)]
 
 pub use rmcp;
 
@@ -47,12 +43,16 @@ pub fn isolate_grok_home_for_tests() {
 
 pub mod acp_transport;
 mod auth_status;
+mod call_result;
 pub mod credentials;
 pub mod elicitation;
+mod generation;
 pub mod liveness;
 pub mod mcp_http_client;
 pub mod oauth;
 pub mod oauth_config;
 pub mod owned_clients;
 pub mod servers;
+pub mod shared_mcp_state;
+mod tool_name;
 pub mod wire;

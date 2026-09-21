@@ -148,7 +148,7 @@ The operations below are treated as read-only and run without prompting, in ever
 - `grep` (content search)
 - `web_search`
 - `todo_write`
-- `get_command_or_subagent_output` / `wait_commands_or_subagents` / `kill_command_or_subagent` (subagent control)
+- `get_command_or_subagent_output` / `kill_command_or_subagent` (subagent control)
 - Invoking skills
 
 ### Read-Only Shell Commands
@@ -340,7 +340,8 @@ A few more matching details:
 - Rules also apply inside a literal script passed to `bash -c`. For `allow`, every command inside that script must itself be allowed.
 - Wrappers not on the list (`sudo`, `xargs`, `nohup`, …) are not peeled. Write rules that name them explicitly.
 - When the parser cannot safely peel a form (for example `env -S`), the command prompts instead of matching an `allow` rule.
-- Matching sees the parsed words joined by single spaces, without shell quotes. Write patterns against the unquoted command.
+- Matching sees parsed literal words joined by single spaces, without shell quotes. Recovered filename variables retain their written spelling; values are never expanded for rule matching.
+- An `allow` rule can cover a quoted filename variable when it is an `ls` or `rg` file operand that follows `--`, carries a literal `/` or `./` prefix, or was assigned a literal path earlier in the same script; `echo`, `head`, and `tail` may appear alongside with literal arguments only, and dynamic options, writes, other programs, and Read/Edit restrictions still prompt. The variable keeps its written spelling, quotes included (`rg -n ERROR "$LOG"`), so match it with `*`. Ask and Auto both honor such a covering `allow` (and an exact remembered grant for the whole script) without the classifier; other scripts with variable arguments go to the classifier in Auto.
 
 ### Dangerous Commands
 
@@ -355,8 +356,10 @@ Path patterns are globs matched against the tool path after lexical normalizatio
 - There are no anchor prefixes: a leading `//` or `~/` in a pattern is treated as literal glob text. Write absolute-path patterns or `**/` patterns instead.
 - Because `.`/`..` are collapsed before matching, rooted patterns cannot be escaped by traversal: `Read(./**)` scopes to the working directory (bare relatives like `src/main.rs` match; `./../../etc/passwd` does not), and `Read(src/**)` stays under `src/`. Unrooted patterns (`*`, or a leading `**` as in `**/*.rs`) intentionally match at any depth, anywhere.
 - `Read` rules also govern `grep` searches; `Grep(...)` rules match only grep.
+- Native Read/Edit/Grep checks follow in-path symlinks for deny and ask on the resolved target. An allow that matches only the resolved target does not grant allow for the tool argument.
+- An in-path symlink that cannot be resolved prompts when any deny or ask file rule applies to that tool.
 
-`Read` and `Edit` deny rules additionally apply to file paths that shell commands touch (for example `cat` or `sed` on a denied path), including literal inline scripts passed to `bash`, `sh`, `dash`, `zsh`, or `ksh` with `-c`; that shell-level check uses the same working-directory-aware normalization (an absolute operand under the working directory also matches rooted rules like `Read(src/**)`) and also resolves symlinks. The direct `read_file`/`search_replace` tool checks do not resolve symlinks. For OS-level enforcement that covers every process, combine deny rules with the sandbox ([18-sandbox.md](18-sandbox.md)).
+`Read` and `Edit` deny rules additionally apply to file paths that shell commands touch (for example `cat` or `sed` on a denied path), including literal inline scripts passed to `bash`, `sh`, `dash`, `zsh`, or `ksh` with `-c`. The shell-level check uses the same working-directory-aware normalization and symlink follow for deny/ask as the direct Read/Edit/Grep tools described above (an absolute operand under the working directory also matches rooted rules like `Read(src/**)`). For OS-level enforcement that covers every process, combine deny rules with the sandbox ([18-sandbox.md](18-sandbox.md)).
 
 ### MCP Rules
 
@@ -553,7 +556,7 @@ Recommended combination for untrusted code:
 
 1. **Prefer narrow patterns.** `Bash(git *)` grants less access than a bare `Bash` allow rule.
 2. **Combine layers.** `dontAsk`, narrow allow rules, a restrictive hook, and the sandbox each restrict independently.
-3. **Review project configuration from unfamiliar sources.** Project permission rules in `.grok/config.toml` and `.claude/settings.json` are gated on folder trust: an untrusted checkout's project rules (including `allow` rules and `defaultMode`) are skipped, and their presence triggers the folder-trust question. Trusting the folder applies them, so review them — and any project hooks — before granting trust to an unfamiliar checkout (see the security notes in [10-hooks.md](10-hooks.md)).
+3. **Review project configuration from unfamiliar sources.** Folder trust gates project permission rules in `.grok/config.toml` and `.claude/settings.json`, plus startup loading of project instructions and skills. Headless startup with these sources requires `--trust` or a prior grant. Review them and any project hooks before trusting an unfamiliar checkout (see [10-hooks.md](10-hooks.md)).
 4. **Test your policy.** With `defaultMode: "dontAsk"` set (or your `PreToolUse` hook installed), run representative commands and confirm what is blocked.
 5. **Treat the read-only command list as a convenience, not a security boundary.**
 

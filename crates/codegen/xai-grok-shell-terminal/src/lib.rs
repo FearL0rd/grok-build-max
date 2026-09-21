@@ -2,6 +2,8 @@
 //!
 //! `xai-grok-shell` re-exports this crate as `xai_grok_shell::terminal`.
 
+#![deny(clippy::indexing_slicing)]
+
 use std::sync::Arc;
 
 pub mod runner;
@@ -36,15 +38,19 @@ pub use streaming_local_terminal::{
 };
 
 pub const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-pub const DEFAULT_OUTPUT_BYTE_LIMIT: usize = 30_000; // 30k characters
+pub const DEFAULT_OUTPUT_BYTE_LIMIT: usize = 30_000;
 
-/// Resolved absolute path to bash. Uses the `xai_grok_config` shell resolution
-/// cascade (`$GROK_SHELL` > `$SHELL` > `which` > common dirs > `/bin/bash`) and
-/// is cached process-wide. Every caller in this crate is gated behind
-/// `#[cfg(unix)]`, so the function only exists there.
-#[cfg(unix)]
+/// Resolved absolute path to bash. On Unix uses the `xai_grok_config` cascade (`$GROK_SHELL` > `$SHELL` > `which` > common dirs > `/bin/bash`), cached process-wide. On non-Unix returns `"/bin/bash"`.
+/// Every caller in this crate is gated behind `#[cfg(unix)]`, so the non-Unix value should not be observed in practice.
 pub(crate) fn default_shell_path() -> &'static str {
-    xai_grok_config::shell::unix_shell_path(xai_grok_config::shell::UnixShellKind::Bash)
+    #[cfg(unix)]
+    {
+        xai_grok_config::shell::unix_shell_path(xai_grok_config::shell::UnixShellKind::Bash)
+    }
+    #[cfg(not(unix))]
+    {
+        "/bin/bash"
+    }
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize)]
@@ -113,11 +119,9 @@ pub async fn list_terminals() -> Vec<TerminalInfo> {
 }
 
 /// Returns environment variables that prevent CLI tools from launching any blocking/waiting programs.
-/// Delegates to the canonical implementation in `xai-grok-tools`.
 pub use xai_grok_tools::util::pager_env;
 
-/// Returns environment variables that encourage CLI tools to emit colored output
-/// and show progress bars/spinners even when running through pipes (non-TTY).
+/// Returns environment variables that encourage CLI tools to emit color and progress bars/spinners even when running through pipes (non-TTY).
 pub fn color_env() -> std::collections::HashMap<String, String> {
     std::collections::HashMap::from([
         ("TERM".to_string(), "xterm-256color".to_string()),
@@ -144,10 +148,8 @@ pub fn color_env() -> std::collections::HashMap<String, String> {
     ])
 }
 
-/// Returns environment variables that disable colors and ANSI escape codes in CLI
-/// tool output. Used when the client sets `x.ai/bashOutputNoColor: true` (e.g.
-/// xai-grok-pager which renders its own UI and doesn't need raw ANSI codes).
-///
+/// Returns environment variables that disable colors and ANSI escape codes in CLI tool output.
+/// Used when the client sets `x.ai/bashOutputNoColor: true` (e.g. xai-grok-pager which renders its own UI and doesn't need raw ANSI codes).
 /// Follows the <https://no-color.org/> convention plus tool-specific overrides.
 pub fn no_color_env() -> std::collections::HashMap<String, String> {
     std::collections::HashMap::from([
@@ -176,7 +178,6 @@ pub fn no_color_env() -> std::collections::HashMap<String, String> {
     ])
 }
 
-/// Terminal runner that routes requests based on the `stream` flag.
 /// `stream: true` uses StreamingLocalTerminalRunner (updates, killable).
 /// `stream: false` uses LocalTerminalRunner (silent, fire and forget).
 pub struct TerminalRunner {

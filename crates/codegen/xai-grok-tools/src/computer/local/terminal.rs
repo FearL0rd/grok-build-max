@@ -42,12 +42,12 @@ const COMPLETED_TASK_TTL: Duration = Duration::from_secs(300);
 /// SIGTERM → SIGKILL grace period.
 const SIGTERM_GRACE: Duration = Duration::from_secs(1);
 /// Max background task lifetime; 10 hours to support long monitor and bash runs.
-const BACKGROUND_MAX_RUNTIME: Duration = Duration::from_secs(36_000);
+pub(crate) const BACKGROUND_MAX_RUNTIME: Duration = Duration::from_secs(36_000);
 /// Max time an auto-backgroundable foreground command blocks the turn before it is
 /// backgrounded (never killed), independent of `timeout`. Env: `GROK_FOREGROUND_BLOCK_BUDGET_MS`.
-const FOREGROUND_BLOCK_BUDGET: Duration = Duration::from_secs(15);
+pub(crate) const FOREGROUND_BLOCK_BUDGET: Duration = Duration::from_secs(15);
 
-fn foreground_block_budget_from_env() -> Duration {
+pub(crate) fn foreground_block_budget_from_env() -> Duration {
     std::env::var("GROK_FOREGROUND_BLOCK_BUDGET_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
@@ -235,6 +235,7 @@ enum TerminalCommand {
     },
 
     ListTasks {
+        include_output: bool,
         reply: oneshot::Sender<Vec<TaskSnapshot>>,
     },
 
@@ -398,7 +399,7 @@ impl ProcessState {
                 .nth(half)
                 .map(|(i, _)| i)
                 .unwrap_or(s.len());
-            self.front_buffer = Some(s[..front_end].as_bytes().to_vec());
+            self.front_buffer = Some(s.get(..front_end).unwrap_or("").as_bytes().to_vec());
         }
 
         let tail_start_char = char_count.saturating_sub(half);
@@ -407,7 +408,7 @@ impl ProcessState {
             .nth(tail_start_char)
             .map(|(i, _)| i)
             .unwrap_or(s.len());
-        self.output_buffer = s[tail_start_byte..].as_bytes().to_vec();
+        self.output_buffer = s.get(tail_start_byte..).unwrap_or("").as_bytes().to_vec();
         self.truncated = true;
     }
 
@@ -428,6 +429,10 @@ impl ProcessState {
 
     fn is_complete(&self) -> bool {
         self.lifecycle.is_complete()
+    }
+
+    fn is_running(&self) -> bool {
+        !self.lifecycle.has_exited() && !self.draining
     }
 
     /// The output is not final until `finish_output`.
@@ -470,6 +475,39 @@ impl ProcessState {
             output_file: self.output_file.clone(),
             truncated: self.truncated || short_of_full_log,
             output_total_bytes: self.total_bytes,
+            exit_code: self.lifecycle.exit_status().and_then(|s| s.exit_code),
+            signal: self.lifecycle.exit_status().and_then(|s| s.signal.clone()),
+            completed: self.is_complete(),
+            block_waited: self.block_waited,
+            explicitly_killed: self.explicitly_killed,
+            kill_result_delivered: self.kill_result_delivered,
+            kind: self.kind,
+            owner_session_id: self.owner_session_id.clone(),
+            description: self.description.clone(),
+            is_backgrounded: self.bg_status.is_backgrounded(),
+        }
+    }
+
+    /// Metadata-only row: no log reads, empty stdout.
+    fn to_task_snapshot_metadata(&self, task_id: &str) -> TaskSnapshot {
+        TaskSnapshot {
+            task_id: task_id.to_string(),
+            command: self.command.clone(),
+            display_command: self.display_command.clone(),
+            cwd: self.cwd.clone(),
+            start_time: self.start_wall_time,
+            end_time: if self.lifecycle.has_exited() {
+                Some(
+                    self.end_wall_time
+                        .unwrap_or_else(std::time::SystemTime::now),
+                )
+            } else {
+                None
+            },
+            output: String::new(),
+            output_file: self.output_file.clone(),
+            truncated: false,
+            output_total_bytes: 0,
             exit_code: self.lifecycle.exit_status().and_then(|s| s.exit_code),
             signal: self.lifecycle.exit_status().and_then(|s| s.signal.clone()),
             completed: self.is_complete(),
@@ -982,6 +1020,9 @@ impl LocalTerminalActor {
                 // Background waits register in completion_waiters, not the
                 // foreground oneshot; deliver them now, not on the next sweep.
                 self.notify_completion_waiters().await;
+                if !already_exited {
+                    self.evict_if_foreground(&task_id);
+                }
             }
             TerminalCommand::Run { request, reply } => {
                 self.handle_run(request, reply).await;
@@ -1012,14 +1053,29 @@ impl LocalTerminalActor {
                 self.handle_wait_for_completion(task_id, timeout, reply)
                     .await;
             }
-            TerminalCommand::ListTasks { reply } => {
+            TerminalCommand::ListTasks {
+                include_output,
+                reply,
+            } => {
                 let mut snapshots =
                     Vec::with_capacity(self.processes.len() + self.completed_task_snapshots.len());
                 for (id, p) in &self.processes {
-                    snapshots.push(p.to_task_snapshot(id).await);
+                    if include_output {
+                        snapshots.push(p.to_task_snapshot(id).await);
+                    } else {
+                        snapshots.push(p.to_task_snapshot_metadata(id));
+                    }
                 }
                 for snap in self.completed_task_snapshots.values() {
-                    snapshots.push(snap.clone());
+                    if include_output {
+                        snapshots.push(snap.clone());
+                    } else {
+                        let mut meta = snap.clone();
+                        meta.output.clear();
+                        meta.output_total_bytes = 0;
+                        meta.truncated = false;
+                        snapshots.push(meta);
+                    }
                 }
                 let _ = reply.send(snapshots);
             }
@@ -1212,7 +1268,11 @@ impl LocalTerminalActor {
 
     async fn handle_kill(&mut self, terminal_id: &str, source: KillSource) -> KillOutcome {
         let Some(process) = self.processes.get_mut(terminal_id) else {
-            return KillOutcome::NotFound;
+            return if self.completed_task_snapshots.contains_key(terminal_id) {
+                KillOutcome::AlreadyExited
+            } else {
+                KillOutcome::NotFound
+            };
         };
 
         if process.lifecycle.has_exited() {
@@ -1439,7 +1499,7 @@ impl LocalTerminalActor {
             let newest_id = self
                 .processes
                 .iter()
-                .filter(|(_, p)| !p.lifecycle.has_exited())
+                .filter(|(_, p)| p.is_running())
                 .max_by_key(|(_, p)| p.start_time)
                 .map(|(id, _)| id.clone());
 
@@ -1466,8 +1526,8 @@ impl LocalTerminalActor {
             .processes
             .iter()
             .filter(|(_, p)| {
-                p.bg_status.is_backgrounded()
-                    && !p.lifecycle.has_exited()
+                p.is_running()
+                    && p.bg_status.is_backgrounded()
                     && p.start_time.elapsed() > BACKGROUND_MAX_RUNTIME
             })
             .map(|(id, _)| id.clone())
@@ -1492,7 +1552,7 @@ impl LocalTerminalActor {
         let size_exceeded: Vec<String> = self
             .processes
             .iter()
-            .filter(|(_, p)| !p.lifecycle.has_exited() && p.total_bytes as u64 > output_cap)
+            .filter(|(_, p)| p.is_running() && p.total_bytes as u64 > output_cap)
             .map(|(id, _)| id.clone())
             .collect();
 
@@ -1611,7 +1671,7 @@ impl LocalTerminalActor {
             if let Some(waiters) = self.completion_waiters.get_mut(&task_id) {
                 let mut i = 0;
                 while i < waiters.len() {
-                    if now >= waiters[i].deadline {
+                    if waiters.get(i).is_some_and(|w| now >= w.deadline) {
                         let waiter = waiters.swap_remove(i);
                         let _ = waiter.reply.send(snapshot.clone());
                         timed_out_tasks.push(task_id.clone());
@@ -1658,6 +1718,16 @@ impl LocalTerminalActor {
                 let snapshot = process.to_task_snapshot(&task_id).await;
                 process.notification_handle.send_task_complete(snapshot);
             }
+        }
+    }
+
+    fn evict_if_foreground(&mut self, task_id: &str) {
+        if self
+            .processes
+            .get(task_id)
+            .is_some_and(|p| !p.bg_status.is_backgrounded())
+        {
+            self.processes.remove(task_id);
         }
     }
 
@@ -1786,7 +1856,9 @@ impl LocalTerminalActor {
                         break;
                     }
                     Some(Ok(n)) => {
-                        new_bytes.extend_from_slice(&buf[..n]);
+                        if let Some(read) = buf.get(..n) {
+                            new_bytes.extend_from_slice(read);
+                        }
                     }
                     Some(Err(_)) => {
                         stdout_eof = true;
@@ -1807,7 +1879,9 @@ impl LocalTerminalActor {
                         break;
                     }
                     Some(Ok(n)) => {
-                        new_bytes.extend_from_slice(&buf[..n]);
+                        if let Some(read) = buf.get(..n) {
+                            new_bytes.extend_from_slice(read);
+                        }
                     }
                     Some(Err(_)) => {
                         stderr_eof = true;
@@ -2042,7 +2116,7 @@ impl LocalTerminalActor {
         let fg_ids: Vec<String> = self
             .processes
             .iter()
-            .filter(|(_, p)| !p.bg_status.is_backgrounded() && !p.lifecycle.has_exited())
+            .filter(|(_, p)| !p.bg_status.is_backgrounded() && p.is_running())
             .map(|(id, _)| id.clone())
             .collect();
 
@@ -2084,7 +2158,7 @@ impl LocalTerminalActor {
             .filter(|(_, p)| {
                 p.owner_session_id.as_deref() == Some(owner_session_id)
                     && !p.bg_status.is_backgrounded()
-                    && !p.lifecycle.has_exited()
+                    && p.is_running()
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -2550,7 +2624,26 @@ impl TerminalBackend for LocalTerminalBackend {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
             .cmd_tx
-            .send(TerminalCommand::ListTasks { reply: reply_tx })
+            .send(TerminalCommand::ListTasks {
+                include_output: true,
+                reply: reply_tx,
+            })
+            .await
+            .is_err()
+        {
+            return vec![];
+        }
+        reply_rx.await.unwrap_or_default()
+    }
+
+    async fn list_tasks_metadata(&self) -> Vec<TaskSnapshot> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .cmd_tx
+            .send(TerminalCommand::ListTasks {
+                include_output: false,
+                reply: reply_tx,
+            })
             .await
             .is_err()
         {
@@ -2748,7 +2841,7 @@ fn spawn_detached_drain(
                 loop {
                     match stdout.read(&mut buf).await {
                         Ok(0) | Err(_) => break,
-                        Ok(n) => output.extend_from_slice(&buf[..n]),
+                        Ok(n) => output.extend_from_slice(buf.get(..n).unwrap_or(&[])),
                     }
                 }
             }
@@ -2757,7 +2850,7 @@ fn spawn_detached_drain(
                 loop {
                     match stderr.read(&mut buf).await {
                         Ok(0) | Err(_) => break,
-                        Ok(n) => output.extend_from_slice(&buf[..n]),
+                        Ok(n) => output.extend_from_slice(buf.get(..n).unwrap_or(&[])),
                     }
                 }
             }
@@ -2785,10 +2878,12 @@ async fn drain_remaining_output(process: &mut ProcessState) {
                 match stdout.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        process.output_buffer.extend_from_slice(&buf[..n]);
+                        process
+                            .output_buffer
+                            .extend_from_slice(buf.get(..n).unwrap_or(&[]));
                         process.total_bytes += n;
                         if let Some(ref mut file) = process.file_handle {
-                            let _ = file.write_all(&buf[..n]).await;
+                            let _ = file.write_all(buf.get(..n).unwrap_or(&[])).await;
                         }
                     }
                 }
@@ -2801,10 +2896,12 @@ async fn drain_remaining_output(process: &mut ProcessState) {
                 match stderr.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        process.output_buffer.extend_from_slice(&buf[..n]);
+                        process
+                            .output_buffer
+                            .extend_from_slice(buf.get(..n).unwrap_or(&[]));
                         process.total_bytes += n;
                         if let Some(ref mut file) = process.file_handle {
-                            let _ = file.write_all(&buf[..n]).await;
+                            let _ = file.write_all(buf.get(..n).unwrap_or(&[])).await;
                         }
                     }
                 }
@@ -2857,7 +2954,7 @@ fn read_available(reader: &mut (impl tokio::io::AsyncRead + Unpin), out: &mut Ve
     loop {
         match try_read_nonblocking(reader, &mut buf) {
             Some(Ok(0)) | Some(Err(_)) | None => return,
-            Some(Ok(n)) => out.extend_from_slice(&buf[..n]),
+            Some(Ok(n)) => out.extend_from_slice(buf.get(..n).unwrap_or(&[])),
         }
     }
 }
@@ -3150,10 +3247,9 @@ fn layer_login_path(
     }
 }
 
-/// Fixed layer order: policy base, login capture (filtered), grok control vars,
-/// request env (filtered), pager vars, login `PATH`, agent marker last. Applied
-/// incrementally, not via `env_clear`: the no-op-policy path must inherit grok's
-/// environment untouched (non-UTF-8 vars included).
+/// Fixed layer order: policy base, login capture (filtered), grok control vars, request env (filtered), pager vars,
+/// login `PATH`, agent marker last. Applied incrementally, not via `env_clear`: the no-op-policy path must inherit
+/// grok's environment untouched (non-UTF-8 vars included).
 #[cfg(unix)]
 fn apply_child_env(
     cmd: &mut tokio::process::Command,
@@ -3242,6 +3338,15 @@ fn spawn_shell_command(
         layer_request_env(&mut cmd, env, active_policy);
         cmd.envs(crate::util::pager_env());
         crate::util::apply_grok_agent_marker(&mut cmd);
+        // After the env layers so a policy PATH is prepended, not replaced. A
+        // policy base env replaced the inherited one; grok's own PATH must not
+        // come back through the prepend (`inherit = none`, an excluded PATH).
+        let path_base = if active_policy.is_some() {
+            xai_tty_utils::PathBase::ExplicitOnly
+        } else {
+            xai_tty_utils::PathBase::Process
+        };
+        xai_tty_utils::prepend_bundled_git_path(cmd.as_std_mut(), path_base);
 
         // Flags set inline: tokio's creation_flags is a SET, not OR, so the detach
         // helpers don't compose. CREATE_BREAKAWAY_FROM_JOB fails with os error 5 when
@@ -3470,25 +3575,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "flaky: combined_output is sometimes empty in CI"]
-    async fn test_simple_command() {
-        let backend = LocalTerminalBackend::new();
-        let request = make_request("echo hello");
-        let output_file = request.output_file.clone();
-
-        let result = backend.run(request).await.unwrap();
-
-        assert_eq!(result.combined_output.trim(), "hello");
-        assert_eq!(result.exit_code, Some(0));
-        assert!(!result.timed_out);
-
-        let file_content = tokio::fs::read_to_string(&output_file).await.unwrap();
-        assert_eq!(file_content.trim(), "hello");
-
-        let _ = tokio::fs::remove_file(&output_file).await;
-    }
-
-    #[tokio::test]
     async fn test_command_with_exit_code() {
         let backend = LocalTerminalBackend::new();
         let result = backend.run(make_request("exit 42")).await.unwrap();
@@ -3619,7 +3705,10 @@ mod tests {
             1,
             "the running command was backgrounded"
         );
-        assert_eq!(backgrounded[0].tool_call_id, tool_call_id);
+        assert_eq!(
+            backgrounded.first().map(|t| t.tool_call_id.as_str()),
+            Some(tool_call_id)
+        );
 
         let result = run.await.unwrap().unwrap();
         assert_eq!(
@@ -3900,54 +3989,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "flaky: combined_output is sometimes empty in CI"]
-    async fn test_multiple_commands() {
-        let backend = LocalTerminalBackend::new();
-
-        let result1 = backend.run(make_request("echo first")).await.unwrap();
-        let result2 = backend.run(make_request("echo second")).await.unwrap();
-
-        assert_eq!(result1.combined_output.trim(), "first");
-        assert_eq!(result2.combined_output.trim(), "second");
-    }
-
-    #[tokio::test]
-    #[ignore = "flaky: output file content sometimes not flushed in CI"]
-    async fn test_output_file_written() {
-        let backend = LocalTerminalBackend::new();
-
-        let output_file =
-            std::env::temp_dir().join(format!("terminal-test-file-{}.out", std::process::id()));
-
-        let request = TerminalRunRequest {
-            command: "echo 'line1'; echo 'line2'; echo 'line3'".to_string(),
-            working_directory: PathBuf::from("/tmp"),
-            env: HashMap::new(),
-            timeout: Duration::from_secs(30),
-            output_byte_limit: 10000,
-            output_file: output_file.clone(),
-            notification_handle: ToolNotificationHandle::noop(),
-            tool_call_id: "test-output-file".to_string(),
-            display_command: None,
-            auto_background_on_timeout: false,
-            foreground_block_budget: None,
-            kind: TaskKind::Bash,
-            owner_session_id: None,
-            description: None,
-        };
-
-        let result = backend.run(request).await.unwrap();
-        assert_eq!(result.exit_code, Some(0));
-
-        let file_content = tokio::fs::read_to_string(&output_file).await.unwrap();
-        assert!(file_content.contains("line1"));
-        assert!(file_content.contains("line2"));
-        assert!(file_content.contains("line3"));
-
-        let _ = tokio::fs::remove_file(&output_file).await;
-    }
-
-    #[tokio::test]
     async fn test_run_background_and_get_task() {
         let backend = LocalTerminalBackend::new();
 
@@ -4060,7 +4101,9 @@ mod tests {
             chunks.len()
         );
 
-        let initial = &chunks[0];
+        let Some(initial) = chunks.first() else {
+            panic!("expected an initial chunk");
+        };
         assert_eq!(initial.base.tool_call_id, "test-call-123");
         assert!(!initial.base.command.is_empty());
         assert!(
@@ -4068,7 +4111,9 @@ mod tests {
             "Initial chunk should have empty output"
         );
 
-        let first_with_output = &chunks[1];
+        let Some(first_with_output) = chunks.get(1) else {
+            panic!("expected a follow-up chunk");
+        };
         assert!(!first_with_output.base.output.is_empty());
 
         assert!(
@@ -4120,11 +4165,12 @@ mod tests {
         }
 
         for w in chunks.windows(2) {
+            let [a, b] = w else { continue };
             assert!(
-                w[1].base.total_bytes >= w[0].base.total_bytes,
+                b.base.total_bytes >= a.base.total_bytes,
                 "total_bytes regressed: {} < {}",
-                w[1].base.total_bytes,
-                w[0].base.total_bytes
+                b.base.total_bytes,
+                a.base.total_bytes
             );
         }
 
@@ -4350,46 +4396,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "flaky: output buffer sometimes not flushed before kill completes"]
-    async fn test_output_preserved_on_kill() {
-        let backend = LocalTerminalBackend::new();
-        let tmp = tempfile::TempDir::new().unwrap();
-
-        let request = TerminalRunRequest {
-            command: "echo before_kill; sleep 60".to_string(),
-            working_directory: PathBuf::from("/tmp"),
-            env: HashMap::new(),
-            timeout: Duration::from_secs(30),
-            output_byte_limit: 10000,
-            output_file: tmp.path().join("kill-output.out"),
-            notification_handle: ToolNotificationHandle::noop(),
-            tool_call_id: "test-kill-output".to_string(),
-            display_command: None,
-            auto_background_on_timeout: false,
-            foreground_block_budget: None,
-            kind: TaskKind::Bash,
-            owner_session_id: None,
-            description: None,
-        };
-
-        let handle = backend.run_background(request).await.unwrap();
-
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        let outcome = backend.kill_task(&handle.task_id).await;
-        assert_eq!(outcome, KillOutcome::Killed);
-
-        let snapshot = backend.get_task(&handle.task_id).await;
-        if let Some(snapshot) = snapshot {
-            assert!(
-                snapshot.output.contains("before_kill"),
-                "Output should contain 'before_kill', got: {:?}",
-                snapshot.output
-            );
-        }
-    }
-
-    #[tokio::test]
     async fn test_output_preserved_on_timeout() {
         // 2s timeout so the poll loop gets enough ticks to read the echo
         // before the timeout handler snapshots the buffer.
@@ -4464,34 +4470,25 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "flaky: pgrep sees sleep processes from other sandbox co-tenants"]
-    async fn test_kill_kills_child_processes() {
-        let backend = LocalTerminalBackend::new();
-        let request = make_request("bash -c 'sleep 60 & sleep 60 & wait'");
-
-        let handle = backend.run_background(request).await.unwrap();
-
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        let _ = backend.kill_task(&handle.task_id).await;
+    async fn draining_foreground_command_survives_a_kill() {
+        let backend = std::sync::Arc::new(LocalTerminalBackend::new_with_tick_interval(
+            Duration::from_millis(20),
+        ));
+        let run = tokio::spawn({
+            let backend = backend.clone();
+            async move { backend.run(make_request("sleep 5 &\necho done")).await }
+        });
 
         tokio::time::sleep(Duration::from_millis(500)).await;
+        backend.kill_foreground_commands().await;
 
-        #[cfg(unix)]
-        {
-            let pgrep = std::process::Command::new("pgrep")
-                .arg("-P")
-                .arg(std::process::id().to_string())
-                .arg("sleep")
-                .output()
-                .expect("pgrep should run");
-
-            assert!(
-                pgrep.stdout.is_empty(),
-                "Expected no sleep processes to remain, but pgrep found: {:?}",
-                String::from_utf8_lossy(&pgrep.stdout)
-            );
-        }
+        let result = run.await.unwrap().expect("run returns a result");
+        assert_eq!(result.exit_code, Some(0), "signal={:?}", result.signal);
+        assert!(
+            result.combined_output.contains("done"),
+            "output={:?}",
+            result.combined_output
+        );
     }
 
     #[test]
