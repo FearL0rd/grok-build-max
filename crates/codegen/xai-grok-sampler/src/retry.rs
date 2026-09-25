@@ -6,6 +6,10 @@ pub const RATE_LIMIT_RETRY_THRESHOLD: u32 = 2;
 
 pub const RATE_LIMIT_RETRY_DISABLED: u32 = 1;
 
+/// A server-signalled rate-limit wait at least this long skips the
+/// same-provider retry loop entirely and fails over immediately.
+pub const LONG_RATE_LIMIT_RETRY_AFTER_SECS: u64 = 30;
+
 pub const DEFAULT_MAX_RETRIES: u32 = 15;
 
 pub const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(30);
@@ -129,6 +133,13 @@ pub fn classify_error(
 
     if err.is_rate_limited() {
         let next_attempt = retry_count + 1;
+        // Long server-signalled waits (weekly limits, hourly quotas) must
+        // not burn the same-provider retry budget sleeping; go Fatal so
+        // the chain rolls to the next provider now. Short waits (burst
+        // control) keep the normal threshold path.
+        if err.retry_after().is_some_and(|secs| secs >= LONG_RATE_LIMIT_RETRY_AFTER_SECS) {
+            return RetryDecision::Fatal(clone_error(err));
+        }
         if next_attempt >= max_retries.min(rate_limit_threshold) {
             return RetryDecision::Fatal(clone_error(err));
         }
@@ -628,6 +639,27 @@ mod tests {
     }
 
     #[test]
+    fn long_retry_after_fails_over_immediately() {
+        // 7s (burst control) keeps the same-provider backoff retry...
+        let short = api_err_with_retry_after(StatusCode::TOO_MANY_REQUESTS, 7);
+        assert!(matches!(
+            classify_error(&short, 0, 5, RATE_LIMIT_RETRY_THRESHOLD),
+            RetryDecision::RetryWithBackoff {
+                is_rate_limited: true,
+                ..
+            }
+        ));
+        // ...but a weekly-limit-shaped wait (>= 30s) must not burn the
+        // budget sleeping on the same provider — Fatal rolls the chain
+        // over now.
+        let long = api_err_with_retry_after(StatusCode::TOO_MANY_REQUESTS, 3600);
+        assert!(matches!(
+            classify_error(&long, 0, 5, RATE_LIMIT_RETRY_THRESHOLD),
+            RetryDecision::Fatal(_)
+        ));
+    }
+
+    #[test]
     fn classify_rate_limited_capped_at_threshold() {
         let err = api_err(StatusCode::TOO_MANY_REQUESTS, "slow");
         match classify_error(&err, 1, 5, RATE_LIMIT_RETRY_THRESHOLD) {
@@ -751,9 +783,21 @@ mod tests {
         }
 
         let rate_limited = api_err_with_retry_after(StatusCode::TOO_MANY_REQUESTS, 120);
-        match classify_error(&rate_limited, 0, 15, RATE_LIMIT_RETRY_THRESHOLD) {
+        // A 120s server-signalled wait is past the failover gate: the
+        // chain rolls to the next provider instead of sleeping here.
+        // Short waits still honor the exact backoff (checked below).
+        assert!(
+            matches!(
+                classify_error(&rate_limited, 0, 15, RATE_LIMIT_RETRY_THRESHOLD),
+                RetryDecision::Fatal(_)
+            ),
+            "expected Fatal for long-wait 429, got RetryWithBackoff"
+        );
+
+        let short_wait = api_err_with_retry_after(StatusCode::TOO_MANY_REQUESTS, 7);
+        match classify_error(&short_wait, 0, 15, RATE_LIMIT_RETRY_THRESHOLD) {
             RetryDecision::RetryWithBackoff { backoff, .. } => {
-                assert_eq!(backoff, Duration::from_secs(120));
+                assert_eq!(backoff, Duration::from_secs(7));
             }
             other => panic!("expected RetryWithBackoff for 429, got {other:?}"),
         }

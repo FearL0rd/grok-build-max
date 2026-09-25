@@ -1935,6 +1935,99 @@ async fn chain_entry_without_api_key_is_skipped() {
     server.shutdown();
 }
 
+/// A provider that died rate-limited with a long server wait is
+/// cooldown-skipped on later requests: request 1 rolls over to the backup
+/// after the 429; request 2 must not touch the limited provider at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chain_cooldown_skips_rate_limited_provider_on_next_request() {
+    let limited_hits = Arc::new(AtomicU32::new(0));
+    let limited_hits_handler = Arc::clone(&limited_hits);
+    let limited_app = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let counter = Arc::clone(&limited_hits_handler);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                // Weekly-limit-shaped wait: cooldown + fast-fatal both key
+                // off this.
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [("retry-after", "3600")],
+                    json!({ "error": { "message": "weekly limit reached" } }).to_string(),
+                )
+            }
+        }),
+    );
+    let limited = MockServer::spawn(limited_app).await;
+
+    let backup_hits = Arc::new(AtomicU32::new(0));
+    let backup_hits_handler = Arc::clone(&backup_hits);
+    let backup_app = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let counter = Arc::clone(&backup_hits_handler);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let events = sse::chat_completion_events("saved", "test-model");
+                Sse::new(stream::iter(
+                    events.into_iter().map(Ok::<_, std::convert::Infallible>),
+                ))
+            }
+        }),
+    );
+    let backup = MockServer::spawn(backup_app).await;
+
+    let chain = vec![
+        ("limited".to_string(), test_config(limited.base_url(), "l")),
+        ("backup".to_string(), test_config(backup.base_url(), "b")),
+    ];
+
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let handle = SamplerActor::spawn(
+        test_config("http://127.0.0.1:9/v1".to_string(), "seed"),
+        RetryPolicy::default(),
+        event_tx,
+    );
+    handle.update_chain(chain);
+
+    // Request 1: the limited provider 429s, the walk rolls to backup.
+    handle.submit(RequestId::from("cooldown-1"), user_request("hi"));
+    match recv_until_chain_terminal(&mut event_rx).await {
+        SamplingEvent::Completed { .. } => {}
+        SamplingEvent::ProviderRolledOver { .. } | SamplingEvent::ProviderFailed { .. } => {
+            panic!("backup served; no chain-exhaustion noise expected")
+        }
+        other => panic!("expected Completed, got {other:?}"),
+    }
+    // Fast-fatal on the long wait: exactly one wire hit, no 429 retry.
+    assert_eq!(
+        limited_hits.load(Ordering::SeqCst),
+        1,
+        "long retry-after must skip the same-provider 429 retry"
+    );
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 1);
+
+    // Request 2: the limited provider is in cooldown; the walk must start
+    // at backup without touching it again.
+    handle.submit(RequestId::from("cooldown-2"), user_request("again"));
+    match recv_until_chain_terminal(&mut event_rx).await {
+        SamplingEvent::Completed { .. } => {}
+        SamplingEvent::ProviderRolledOver { .. } | SamplingEvent::ProviderFailed { .. } => {
+            panic!("backup served; no chain-exhaustion noise expected")
+        }
+        other => panic!("expected Completed, got {other:?}"),
+    }
+    assert_eq!(
+        limited_hits.load(Ordering::SeqCst),
+        1,
+        "cooled-down provider must not be re-hit by the next request"
+    );
+    assert_eq!(backup_hits.load(Ordering::SeqCst), 2);
+
+    limited.shutdown();
+    backup.shutdown();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn poll_chain_returns_installed_chain() {
     let chain = vec![

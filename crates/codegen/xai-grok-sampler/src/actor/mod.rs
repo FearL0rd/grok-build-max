@@ -21,6 +21,12 @@ use crate::types::RequestId;
 pub struct SamplerActor {
     cmd_rx: mpsc::UnboundedReceiver<SamplerCommand>,
     event_tx: mpsc::UnboundedSender<SamplingEvent>,
+    /// Chain tasks report rate-limited providers on this channel so the
+    /// actor can cooldown-skip them for later `Submit`s.
+    cooldown_rx: mpsc::UnboundedReceiver<(String, Option<u64>)>,
+    /// Clone of the cooldown channel's sender, handed to each spawned
+    /// chain task.
+    cooldown_tx: mpsc::UnboundedSender<(String, Option<u64>)>,
     state: ActorState,
     /// The actor's run loop selects on `cmd_rx.recv()` and `tasks.join_next()`.
     /// A finished task returns its `RequestId` so the actor can clean up `active_requests`.
@@ -36,14 +42,21 @@ impl SamplerActor {
         event_tx: mpsc::UnboundedSender<SamplingEvent>,
     ) -> SamplerHandle {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (cooldown_tx, cooldown_rx) = mpsc::unbounded_channel();
         let actor = Self {
             cmd_rx,
             event_tx,
+            cooldown_rx,
+            cooldown_tx: cooldown_tx.clone(),
             state: ActorState::new(config, retry_policy),
             tasks: JoinSet::new(),
         };
         tokio::spawn(actor.run());
         SamplerHandle::new(cmd_tx)
+    }
+
+    fn cooldown_tx_handle(&self) -> mpsc::UnboundedSender<(String, Option<u64>)> {
+        self.cooldown_tx.clone()
     }
 
     async fn run(mut self) {
@@ -82,7 +95,19 @@ impl SamplerActor {
         self.tasks.shutdown().await;
     }
 
+    /// Drain every pending rate-limit report the chain tasks queued into
+    /// the cooldown store. Bounded, cheap, and run before command handling
+    /// so `Submit` sees the freshest skips.
+    fn drain_cooldown_reports(&mut self) {
+        while let Ok((provider, retry_after)) = self.cooldown_rx.try_recv() {
+            self.state.note_rate_limited(&provider, retry_after);
+        }
+    }
+
     fn handle_command(&mut self, cmd: SamplerCommand) {
+        // Chain tasks may have reported a rate-limited provider since the
+        // last command; fold those in before building the next walk.
+        self.drain_cooldown_reports();
         match cmd {
             SamplerCommand::Submit {
                 request_id,
@@ -135,6 +160,23 @@ impl SamplerActor {
                     chain = led;
                     start_index = Some(0);
                 }
+                // Cooldown skip: entries that recently died rate-limited
+                // would only burn the rate-limit retry budget (2 attempts
+                // plus backoff sleeps) before rolling over again. Advance
+                // `start_index` past cooled entries — but only while a
+                // live entry remains ahead; if every entry is cooled the
+                // walk starts at the model's own entry as usual (a fully
+                // cooled chain must still serve requests, not block).
+                if !has_override && !chain.is_empty() {
+                    let base = start_index.unwrap_or(0);
+                    let mut skip = base;
+                    while skip < chain.len() && self.state.is_cooled_down(&chain[skip].0) {
+                        skip += 1;
+                    }
+                    if skip < chain.len() && skip > base {
+                        start_index = Some(skip);
+                    }
+                }
                 let start_index = start_index.unwrap_or(0);
                 self.tasks.spawn(request_task::run_chain_task(
                     request_id,
@@ -145,6 +187,7 @@ impl SamplerActor {
                     event_tx,
                     cancel_token,
                     completion_tx,
+                    self.cooldown_tx_handle(),
                 ));
             }
             SamplerCommand::Cancel { request_id } => {

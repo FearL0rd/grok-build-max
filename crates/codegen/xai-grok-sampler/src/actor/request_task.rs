@@ -133,6 +133,7 @@ pub(crate) async fn run_chain_task(
     event_tx: mpsc::UnboundedSender<SamplingEvent>,
     cancel_token: CancellationToken,
     completion: Option<oneshot::Sender<CollectedSamplingResult>>,
+    cooldown_tx: mpsc::UnboundedSender<(String, Option<u64>)>,
 ) -> RequestId {
     let mut completion = CompletionState::new(completion);
     let mut attempted: Vec<String> = Vec::new();
@@ -205,6 +206,11 @@ pub(crate) async fn run_chain_task(
             } => {
                 attempted.push(name.clone());
                 last_error = Some(clone_error(&error));
+                // Tell the actor this provider died rate-limited so
+                // `Submit` can skip it until the cooldown expires.
+                if error.is_rate_limited() {
+                    let _ = cooldown_tx.send((name.clone(), error.retry_after()));
+                }
                 if output_observed {
                     // Output already reached the session; a rollover would
                     // duplicate it. Surface the underlying failure.
