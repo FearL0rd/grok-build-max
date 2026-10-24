@@ -89,6 +89,7 @@ fn gemini_config(base_url: String) -> SamplerConfig {
         mtls_cert_dir: Default::default(),
         request_compression: Default::default(),
         rate_limit_retry_threshold: Default::default(),
+        max_request_bytes: None,
         reasoning_summary: Default::default(),
         conversation_group_id: Default::default(),
     }
